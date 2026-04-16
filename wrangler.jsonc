@@ -1,0 +1,22 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "gapspark-api",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-26",
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "gapspark-db",
+			"database_id": "d0bd0ddd-c070-4153-ae51-d6843a68168e"
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	},
+	"vars": {
+		"APPLE_BUNDLE_ID": "com.gapspark.GapSpark"
+	},
+	"triggers": {
+		"crons": ["0 */6 * * *"]
+	}
+}
