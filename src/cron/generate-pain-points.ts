@@ -95,13 +95,20 @@ export async function generatePainPoints(
   const apps = await db.prepare(`
     SELECT 
       ta.id as app_id, ta.app_name, ta.category, ta.tags,
-      COUNT(r.id) as negative_count
+      COUNT(r.id) as negative_count,
+      (
+        SELECT COUNT(*) FROM pain_points pp
+        WHERE EXISTS (
+          SELECT 1 FROM json_each(pp.sample_app_ids)
+          WHERE json_each.value = ta.id
+        )
+      ) as existing_pain_points
     FROM tracked_apps ta
     JOIN reviews r ON r.tracked_app_id = ta.id
     WHERE r.sentiment_label = 'NEGATIVE' AND r.sentiment_score IS NOT NULL
     GROUP BY ta.id
     HAVING negative_count >= 5
-    ORDER BY negative_count DESC
+    ORDER BY existing_pain_points ASC, negative_count DESC
     LIMIT ?
   `).bind(appsPerRun).all<AppWithReviews & { negative_count: number }>()
 

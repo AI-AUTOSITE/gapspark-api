@@ -582,7 +582,29 @@ app.get('/api/debug/deep-dive/:id', async (c) => {
 export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
-    console.log('Cron job started:', new Date().toISOString())
+    // どのCronスケジュールが起動したかで処理を分ける
+    // "*/15 * * * *" = 感情分析ファストレーン（15分ごと・少量）
+    // それ以外（"0 */6 * * *"）= フルパイプライン（6時間ごと）
+    if (controller.cron === '*/15 * * * *') {
+      // 【高頻度・15分ごと】感情分析だけを安全な少量（40件）で処理。
+      // 40件はレート制限（約48件）の内側なので、ほぼ全件成功する。
+      // 40件 × 96回/日 ≒ 3,840件/日 → 未分析バックログを高速消化。
+      console.log('Cron (sentiment fast lane) started:', new Date().toISOString())
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const r = await analyzeSentiment(env.DB, env.AI, 40)
+            console.log('Sentiment fast lane:', JSON.stringify(r))
+          } catch (err) {
+            console.error('Sentiment fast lane error:', err)
+          }
+        })()
+      )
+      return
+    }
+
+    // 【6時間ごと】フルパイプライン: レビュー取得 → 感情分析 → ペインポイント生成
+    console.log('Cron (full pipeline) started:', new Date().toISOString())
     ctx.waitUntil(
       (async () => {
         try {
@@ -590,8 +612,8 @@ export default {
           const fetchResult = await fetchAndStoreReviews(env.DB)
           console.log('Cron Step 1 (fetch):', JSON.stringify(fetchResult))
 
-          // Step 2: 感情分析（最大500件の未分析レビュー）
-          const sentimentResult = await analyzeSentiment(env.DB, env.AI, 500)
+          // Step 2: 感情分析（安全な少量。バルク消化は15分ごとのファストレーンが担当）
+          const sentimentResult = await analyzeSentiment(env.DB, env.AI, 40)
           console.log('Cron Step 2 (sentiment):', JSON.stringify(sentimentResult))
 
           // Step 3: ペインポイント生成（最大10アプリ）
