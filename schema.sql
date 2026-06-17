@@ -122,3 +122,24 @@ CREATE TRIGGER IF NOT EXISTS reviews_ad AFTER DELETE ON reviews BEGIN
     INSERT INTO reviews_fts(reviews_fts, rowid, title, body)
     VALUES ('delete', old.id, old.title, old.body);
 END;
+
+-- ============================================================
+-- Performance Indexes（Migration 0001 と同内容 — 新規DB構築時に作成）
+-- 既存の本番DBには migrations/0001_add_indexes.sql を実行すること
+-- ============================================================
+CREATE INDEX IF NOT EXISTS idx_reviews_unanalyzed
+    ON reviews(id) WHERE sentiment_score IS NULL;
+CREATE INDEX IF NOT EXISTS idx_reviews_app_sentiment
+    ON reviews(tracked_app_id, sentiment_label, sentiment_score);
+CREATE INDEX IF NOT EXISTS idx_deep_dives_pain_point
+    ON deep_dives(pain_point_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_saved_ideas_user
+    ON saved_ideas(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_app_requests_user
+    ON app_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_app_requests_status
+    ON app_requests(status);
+CREATE INDEX IF NOT EXISTS idx_pain_points_severity
+    ON pain_points(severity_score);
+CREATE INDEX IF NOT EXISTS idx_pain_points_category
+    ON pain_points(category);
