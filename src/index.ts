@@ -34,25 +34,22 @@ app.get('/', (c) => {
 
 app.get('/api/health', async (c) => {
   try {
-    const result = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM tracked_apps'
-    ).first()
-    const reviewCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM reviews'
-    ).first()
-    const analyzedCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM reviews WHERE sentiment_score IS NOT NULL'
-    ).first()
-    const painPointCount = await c.env.DB.prepare(
-      'SELECT COUNT(*) as count FROM pain_points'
-    ).first()
+    // 4つのCOUNTを1往復のbatchでまとめて実行（順次awaitより高速）
+    // ※ JSONのキーは従来どおり（iOSのHealthStatsがそのままデコードできる）
+    const stats = await c.env.DB.batch([
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM tracked_apps'),
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews'),
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews WHERE sentiment_score IS NOT NULL'),
+      c.env.DB.prepare('SELECT COUNT(*) as count FROM pain_points'),
+    ])
+
     return c.json({
       status: 'ok',
       database: 'connected',
-      tracked_apps: result?.count ?? 0,
-      reviews: reviewCount?.count ?? 0,
-      reviews_analyzed: analyzedCount?.count ?? 0,
-      pain_points: painPointCount?.count ?? 0
+      tracked_apps: (stats[0].results?.[0] as any)?.count ?? 0,
+      reviews: (stats[1].results?.[0] as any)?.count ?? 0,
+      reviews_analyzed: (stats[2].results?.[0] as any)?.count ?? 0,
+      pain_points: (stats[3].results?.[0] as any)?.count ?? 0
     })
   } catch (error) {
     return c.json({

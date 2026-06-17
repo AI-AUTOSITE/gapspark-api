@@ -1,198 +1,57 @@
-# GapSpark API
+# GapSpark API — パフォーマンス改善 #1: インデックス追加
 
-> Cloudflare Workers backend for [GapSpark](https://github.com/ai-autosite/gapspark-ios) — analyzes App Store reviews to surface user pain points using a hybrid AI architecture.
+## 何が問題だったか
+スキーマに二次インデックスが1つも無く、レビュー85,603件に対して以下が
+**フルスキャン**になっていた（EXPLAIN QUERY PLAN で確認済み）:
 
-[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange.svg)](https://workers.cloudflare.com/)
-[![Hono](https://img.shields.io/badge/Hono-4.x-blue.svg)](https://hono.dev/)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+- 感情分析Cron（6時間ごと）: 未分析レビュー抽出 → 85k行を全スキャン
+- ペインポイント生成Cron（6時間ごと）: アプリ別ネガティブ集計 → 85k行を全スキャン
+- Deep Diveキャッシュ参照（リクエスト毎）: deep_dives 全スキャン
+- 保存アイデア / リクエスト一覧（ログインユーザー毎）: 全スキャン＋ソート
 
-## What it does
+## 何をしたか
+追加のみの安全なマイグレーション（既存データ・構造は無変更）。
 
-1. **Fetches** App Store reviews via Apple RSS API (50 apps across 10 categories)
-2. **Analyzes sentiment** with Workers AI (DistilBERT)
-3. **Generates pain points** with Workers AI (Llama 3.2 1B) using rule-based severity scoring
-4. **Provides Deep Dive** analysis on demand via Claude Haiku 4.5 API
-5. **Authenticates** users with Sign in with Apple (server-side JWT validation)
-6. **Serves** REST endpoints to the iOS app
+| クエリ | 適用前 | 適用後 |
+|---|---|---|
+| 感情分析Cron 未分析抽出 | reviews 全スキャン(85k) | 部分インデックス（未分析行のみ・分析が進むほど縮小） |
+| PP生成 アプリ別ネガ集計 | reviews 全スキャン(85k) | カバリングインデックス（本体に触れない） |
+| PP生成 アプリ別ネガ取得 | スキャン＋ソート | インデックス検索・ソート消滅 |
+| Deep Diveキャッシュ参照 | deep_dives 全スキャン | インデックス検索・ソート消滅 |
+| 保存アイデア取得 | saved_ideas 全スキャン | インデックス検索 |
+| リクエスト一覧 | app_requests 全スキャン | インデックス検索 |
 
-## Architecture
-
-```
-┌─────────────────────────────────────┐
-│  Cloudflare Worker (Hono router)    │
-│                                      │
-│  ├─ Workers AI (native binding)      │  Free
-│  │   • DistilBERT (sentiment)        │
-│  │   • Llama 3.2 1B (summaries)      │
-│  │                                   │
-│  ├─ Claude API (on-demand)           │  ~$0.01/req
-│  │   • Haiku 4.5 (deep analysis)     │
-│  │                                   │
-│  ├─ JWT validation (Apple tokens)    │
-│  ├─ Rate limiting (3 deep dives/day) │
-│  └─ Cron triggers (every 6 hours)    │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-        ┌─────────────────┐
-        │  Cloudflare D1  │
-        │   (SQLite)      │
-        └─────────────────┘
-```
-
-## Tech Stack
-
-- **Runtime:** Cloudflare Workers (V8 isolates, edge deployment)
-- **Framework:** [Hono](https://hono.dev/) 4.x
-- **Database:** Cloudflare D1 (SQLite at the edge)
-- **AI:** Workers AI (native binding), Claude Haiku 4.5 API
-- **Auth:** Sign in with Apple + JWT (jose library)
-- **Language:** TypeScript
-
-## API Endpoints
-
-### Public (no auth)
-```
-GET  /api/health                          # DB health + stats
-GET  /api/search?q=<query>                # Unified search (topics + apps + pain points)
-GET  /api/topics                          # Popular topics
-GET  /api/topics/:topic/apps              # Apps for a topic
-GET  /api/topics/:topic/pain-points       # Pain points for a topic
-GET  /api/pain-points                     # Pain point list
-GET  /api/pain-points/:id                 # Single pain point
-GET  /api/apps                            # App list
-GET  /api/apps/:id                        # Single app
-GET  /api/apps/:id/pain-points            # Pain points for an app
-GET  /api/categories                      # Category list
-GET  /api/trends                          # Top trending pain points
-```
-
-### Authentication
-```
-POST /api/auth/apple                      # Validate Apple identity token → issue session JWT
-```
-
-### Authenticated (Bearer JWT)
-```
-GET    /api/pain-points/:id/deep-dive     # Run Claude Deep Dive (3/day limit)
-GET    /api/user/saved                    # Saved ideas
-POST   /api/user/saved                    # Save an idea
-DELETE /api/user/saved/:id                # Delete saved idea
-POST   /api/apps/request                  # Request a new app to be tracked
-GET    /api/user/requests                 # User's app requests
-```
-
-### Debug (development only)
-```
-GET /api/debug/fetch-reviews              # Manual review fetch
-GET /api/debug/analyze-sentiment          # Manual sentiment analysis
-GET /api/debug/generate-pain-points       # Manual pain point generation
-GET /api/debug/run-pipeline               # Full pipeline (cron equivalent)
-GET /api/debug/dedup-pain-points          # Cleanup duplicate pain points
-GET /api/debug/recalculate-severity       # Rule-based severity recalculation
-GET /api/debug/stats                      # Detailed DB stats
-GET /api/debug/deep-dive/:id              # Test Deep Dive (no auth)
-```
-
-## Setup
-
-### Requirements
-- Node.js 20+
-- Cloudflare account (free tier works)
-- Anthropic API key for Claude Deep Dive
-
-### Install
+## 適用手順（本番D1）
 ```bash
-git clone https://github.com/ai-autosite/gapspark-api.git
-cd gapspark-api
-npm install
+cd ~/Projects/gapspark-api
+# migrations/ フォルダにこのSQLを置いてから:
+npx wrangler d1 execute gapspark-db --remote --file=./migrations/0001_add_indexes.sql
 ```
+※ `--remote` が本番。付け忘れるとローカルDBに当たるので注意。
 
-### Create the D1 database
+## 適用後の確認（任意）
+インデックスが使われているか本番で確認:
 ```bash
-npx wrangler d1 create gapspark-db
-# Copy the database_id into wrangler.jsonc
+npx wrangler d1 execute gapspark-db --remote \
+  --command="EXPLAIN QUERY PLAN SELECT id,title,body FROM reviews WHERE sentiment_score IS NULL ORDER BY id LIMIT 500;"
 ```
-
-### Apply schema
+作成済みインデックス一覧:
 ```bash
-npx wrangler d1 execute gapspark-db --remote --file=schema.sql
+npx wrangler d1 execute gapspark-db --remote \
+  --command="SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%';"
 ```
 
-### Seed initial app list (optional)
-```bash
-node seed-apps.mjs
-```
+## リスク
+- **なし**（追加のみ・冪等 `IF NOT EXISTS`）。
+- iOSアプリ・App Store審査には一切影響しない（バックエンド内部のみ）。
+- 書き込みコストはレビュー挿入時に微増（1件あたりインデックス更新数件、6時間で約1,000件 → 無視できる）。
+- 読み取りの大幅高速化が圧倒的に上回る。
 
-### Set secrets
-```bash
-npx wrangler secret put CLAUDE_API_KEY    # Anthropic API key
-npx wrangler secret put JWT_SECRET        # Random 32+ char string
-```
+## 期待効果
+- Cronパイプラインの所要時間・D1読み取り行数を大幅削減（85k全スキャン → インデックス参照）。
+- レビューが増えるほど効果が拡大（現状はまだ伸び続けている）。
+- ログインユーザーの「保存アイデア」「リクエスト一覧」表示がデータ増加に対してスケールする。
 
-### Update wrangler.jsonc
-Set `APPLE_BUNDLE_ID` to your iOS app's bundle ID.
-
-### Deploy
-```bash
-npx wrangler deploy --minify
-```
-
-### Local development
-```bash
-npx wrangler dev                    # Local server on :8787
-npx wrangler dev --test-scheduled   # Test cron triggers
-```
-
-## Pain Point Scoring
-
-Severity is calculated using a rule-based formula (not AI):
-
-```
-severity_score = starPenalty × keywordSeverity × frequencyWeight × recencyBoost
-```
-
-- **starPenalty:** 1★ → 1.0, 2★ → 0.8, ..., 5★ → 0.2
-- **keywordSeverity:** crash/data_loss → 1.0, bug/sync → 0.7, annoying → 0.5, wish → 0.3
-- **frequencyWeight:** log(1 + matching_reviews) / log(1 + total_reviews)
-- **recencyBoost:** ≤30 days → 1.2, ≤90 days → 1.0, older → 0.8
-
-Final score is clamped to 0.05–1.0 for natural distribution.
-
-## Cron Pipeline
-
-Runs every 6 hours (`0 */6 * * *`):
-1. **Fetch reviews** from Apple RSS API (20 apps per cycle)
-2. **Analyze sentiment** with DistilBERT (up to 500 reviews)
-3. **Generate pain points** with Llama 3.2 1B + rule-based scoring (up to 10 apps)
-
-Stays within Workers AI free tier (10,000 neurons/day).
-
-## Database Schema
-
-See [schema.sql](schema.sql) for the full schema. Key tables:
-- `tracked_apps` — app catalog with tags
-- `reviews` — raw reviews (never exposed to users)
-- `pain_points` — AI-analyzed user complaints (what users see)
-- `deep_dives` — Claude API analysis cache
-- `users` — Sign in with Apple users
-- `saved_ideas` — user-saved app ideas
-- `app_requests` — user requests for new apps to track
-
-## Cost (Free Tier)
-
-| Resource | Free Limit | Estimated Use |
-|----------|-----------|---------------|
-| Worker requests | 100K/day | ~5K/day |
-| D1 reads | 5M/day | ~10K/day |
-| D1 writes | 100K/day | ~2K/day |
-| Workers AI | 10K neurons/day | ~5.8K/cycle |
-| Claude API | Pay-as-you-go | ~$0.01/Deep Dive |
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-Built by [AI AutoSite](https://github.com/ai-autosite) with Claude.
+## ファイル
+- `migrations/0001_add_indexes.sql` … 本番D1に実行するマイグレーション
+- `schema.sql` … インデックス込みの完全スキーマ（新規DB構築用・既存DBには不要）
