@@ -466,7 +466,9 @@ app.get('/api/debug/fetch-reviews', async (c) => {
 // 2. 感情分析（NEW）
 app.get('/api/debug/analyze-sentiment', async (c) => {
   console.log('Manual sentiment analysis triggered')
-  const batchSize = parseInt(c.req.query('batch') || '500')
+  // デフォルトは安全な40件（レート制限の内側）。batch でも limit でも指定可。
+  // 大きい値を渡すとレート制限に当たり大量エラーになるので注意。
+  const batchSize = parseInt(c.req.query('batch') || c.req.query('limit') || '40')
   const result = await analyzeSentiment(c.env.DB, c.env.AI, batchSize)
   return c.json({
     message: 'Sentiment analysis completed',

@@ -1,83 +1,111 @@
-# GapSpark API — 感情分析を高速化（バックログ消化）
+# GapSpark — Marketing & Legal Site
 
-## 何が問題だったか（遅さの正体）
-感情分析Cronが1回で **500件を一気に** 処理しようとしていた。しかし Workers AI の
-レート制限（約48件で頭打ち→60秒待ちが必要）に当たり、
+Next.js 14 marketing site, privacy policy, and terms of service for [GapSpark](https://github.com/ai-autosite/gapspark-ios).
 
-- 最初の約48件だけ成功
-- 残り約452件はエラーで捨てられ、次のCronで再試行→また48件で頭打ち…
+**Live:** https://gapspark.defrust.com
 
-の繰り返し。実効スループットは **約48件 × 1日4回 ≒ 192件/日**。
-（実データ: 2ヶ月で11,923件 ≒ 192×62日 とほぼ一致）
+## Pages
 
-## 何を直したか
-「一度に大量投下してレート制限に当たる」のをやめ、
-**「制限に当たらない少量（40件）を高頻度（15分ごと）に」** 処理する方式に変更。
+- `/` → Landing page
+- `/privacy` → Privacy policy
+- `/terms` → Terms of service
 
-- 40件はレート制限（約48件）の内側 → ほぼ全件成功
-- 40件 × 96回/日 ≒ **3,840件/日**（今の約20倍）
-- 各実行は約10秒で完了 → 無料枠でも安全
+## Tech stack
 
-感情分析の中身（analyze-sentiment.ts）は無変更。**呼び方だけ**変えた。
+- **Next.js 14.2.3** (App Router) — stable, no experimental features
+- **React 18.2.0** — stable
+- **TypeScript 5.3** — relaxed settings (strict: false)
+- **Tailwind CSS 3.4** — utility-first styling
+- No turbopack, no React 19, no Tailwind v4
 
-### 変更点
-1. `wrangler.jsonc`: Cronを2本に
-   - `"0 */6 * * *"`（従来）= フルパイプライン（取得→分析→ペインポイント）
-   - `"*/15 * * * *"`（新規）= 感情分析ファストレーン（40件だけ）
-2. `src/index.ts`: scheduled ハンドラを「どのCronが起動したか」で分岐
-   - 15分Cron → 感情分析40件のみ
-   - 6時間Cron → 従来のフルパイプライン（感情分析は500→40に縮小）
+## Local development
 
-※ 無料枠のCronトリガーは3本まで。今回2本目を使用（まだ1本余裕）。
-
-## やること（2ステップ）
-
-### 1. 2ファイルを差し替え
-- `~/Projects/gapspark-api/wrangler.jsonc`
-- `~/Projects/gapspark-api/src/index.ts`
-
-### 2. デプロイ
 ```bash
-cd ~/Projects/gapspark-api
-npx wrangler deploy --minify
+npm install
+npm run dev
+# → http://localhost:3000
 ```
-デプロイ後、出力の `schedule:` に **2本** 表示されればOK
-（`0 */6 * * *` と `*/15 * * * *`）。
 
-## 効果の確認（翌日）
-ブラウザで /api/health を開いて `reviews_analyzed` の数を見る:
+## Adding assets
+
+### App icon
+Place `icon.png` (1024×1024) in `public/`:
 ```
-https://gapspark-api.pricedrop-app.workers.dev/api/health
+public/icon.png
 ```
-今日: 11,923 → 翌日: 数千件単位で増えていれば成功（理想は +2,000〜3,000/日）。
-数日で「分析済み」が大きく伸び、それに連れてペインポイントも増えていく。
+Used in: navigation bar, hero section, Open Graph preview, favicon, footer.
 
-## 正直な注意（神経予算 = ニューロン）
-Workers AI 無料枠は **1日10,000ニューロン**（毎日00:00 UTCにリセット、全モデル共通）。
-感情分析40件×96回/日 ≒ 約1,800ニューロン/日なので感情分析自体は軽い。
-ただし **ペインポイント生成（Llama）と予算を共有** している。先日アプリ網羅性を
-直したことで生成対象アプリが増え、ニューロン消費も増える。
+### Screenshots
+Screenshots live in `public/screenshots/` as web-optimized **WebP** (resized to
+640px wide; App Store PNGs are ~2.2 MB total, the WebP set is ~250 KB):
 
-→ もし翌日に `reviews_analyzed` が **あまり増えていなかったら**、1日の
-   ニューロン予算を使い切っているサイン。その場合の次の一手:
-   - ペインポイント生成の頻度を下げる（6時間→24時間。生成は毎時間やる必要はない）
-   - もしくは Workers 有料プラン（$5/月）でニューロン上限を引き上げ
+```
+public/screenshots/hero.webp        # Hero phone mockup (cropped, frameless Discover screen)
+public/screenshots/discover.webp    # Discover tab
+public/screenshots/painpoint.webp   # Pain point detail
+public/screenshots/deepdive.webp    # Deep Dive analysis
+public/screenshots/concept.webp     # App concept
+public/screenshots/ideas.webp       # Saved ideas
+public/screenshots/search.webp      # Unified search
+```
 
-まずはこのまま1日様子を見るのが安全。数字を見てから次を判断。
+**Note on framing:**
+- The 6 grid screenshots (`Screenshots.tsx`) already include a device frame, so the
+  component shows them directly (no extra frame) with rounded corners + shadow.
+- The hero (`Hero.tsx`) draws its own device frame, so `hero.webp` is the **app screen
+  only** (frame/background cropped out) so it sits cleanly inside that frame.
 
-## リスク / 戻し方
-- 各実行が短く（約10秒）レート制限内なので安全。
-- 元に戻すには wrangler.jsonc のcronを1本に戻し、index.tsを前の版に戻して再デプロイ。
-- iOSアプリ・App Store審査に影響なし（バックエンド内部のみ）。
+If an image is missing, a placeholder caption displays in its place — no layout breakage.
 
-## Git コミット用メッセージ（任意）
-Summary:
-    perf(cron): add 15-min sentiment fast lane to clear analysis backlog
+## Structure
 
-Description:
-    Sentiment analysis fired 500 calls per 6h cron but Workers AI rate
-    limits (~48/window) meant only ~48 succeeded and ~452 errored and
-    were retried next run — effective throughput ~192/day. Added a
-    dedicated */15 cron that analyzes a rate-limit-safe batch (40) each
-    run (~3,840/day), gated in scheduled() via controller.cron. The 6h
-    full pipeline now uses a 40 batch too. analyze-sentiment.ts unchanged.
+```
+gapspark-web/
+├── app/
+│   ├── layout.tsx          # Root layout with metadata
+│   ├── page.tsx            # Landing page
+│   ├── globals.css         # Tailwind + CSS variables
+│   ├── privacy/page.tsx    # Privacy policy
+│   └── terms/page.tsx      # Terms of service
+├── components/
+│   ├── Nav.tsx             # Sticky blur nav
+│   ├── Hero.tsx            # Hero section with phone mockup
+│   ├── ProblemStatement.tsx
+│   ├── Features.tsx        # 6 feature cards
+│   ├── Screenshots.tsx     # 6-phone screenshot grid
+│   ├── HowItWorks.tsx      # 4 numbered steps
+│   ├── TechStack.tsx       # 4-layer AI architecture
+│   ├── CTA.tsx             # Final call-to-action
+│   └── Footer.tsx          # Footer with links
+├── public/
+│   ├── icon.png            # App icon
+│   └── screenshots/        # Marketing screenshots (.webp)
+├── package.json
+├── tsconfig.json
+├── tailwind.config.js
+├── postcss.config.js
+├── next.config.js
+└── README.md
+```
+
+## Deployment (Vercel)
+
+The site is connected to Vercel via GitHub. Every push to `main` auto-deploys;
+pull requests get preview URLs automatically.
+
+### Custom domain
+
+In Vercel project → Settings → Domains:
+- `gapspark.defrust.com` (CNAME)
+
+## Design notes
+
+- Apple-inspired aesthetic with system fonts (SF Pro)
+- Responsive grid — phones, tablets, desktop
+- Auto dark/light mode via `prefers-color-scheme`
+- No third-party trackers, analytics, or fonts
+- Privacy-first by default
+
+## License
+
+MIT

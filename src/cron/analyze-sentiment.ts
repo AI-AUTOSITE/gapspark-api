@@ -60,7 +60,11 @@ export async function analyzeSentiment(
   for (const review of reviews.results) {
     try {
       // レビューのタイトル + 本文を結合（DistilBERTに渡すテキスト）
-      const text = `${review.title} ${review.body}`.trim()
+      // DistilBERTは最大512トークン。長文レビューはトークン超過(AiError 3030)になるため、
+      // 安全な長さ(800文字)に切り詰める。感情判定は冒頭で十分なので精度影響はほぼない。
+      const MAX_CHARS = 800
+      const combined = `${review.title} ${review.body}`.trim()
+      const text = combined.length > MAX_CHARS ? combined.slice(0, MAX_CHARS) : combined
 
       if (text.length === 0) {
         // 空テキストはスキップ（中立として保存）
@@ -102,7 +106,14 @@ export async function analyzeSentiment(
       }
 
     } catch (e) {
+      const msg = String(e)
       console.error(`  Sentiment error for review ${review.id}:`, e)
+      // 恒久的エラー（トークン超過 3030 = 本文が原因。再試行しても無駄）だけ
+      // NEUTRALで確定し、キューに居座らせない。
+      // レート制限などの一時的エラーは未分析(NULL)のまま残し、次回再試行させる。
+      if (msg.includes('max tokens') || msg.includes('3030')) {
+        batchUpdates.push(updateStmt.bind(0.0, 'NEUTRAL', review.id))
+      }
       errors++
     }
   }
