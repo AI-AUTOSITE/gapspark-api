@@ -400,6 +400,31 @@ app.delete('/api/user/saved/:id', async (c, next) => {
   }
 })
 
+// アカウント削除（認証必須） - Apple Guideline 5.1.1(v) 対応
+// ログイン中ユーザーに紐づく全データ + ユーザー本体を完全に削除する。
+// 一時停止ではなく完全削除（Appleの要件）。
+app.delete('/api/user/account', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+
+    // 子テーブル → users 本体 の順で一括削除（db.batch でまとめて実行）
+    await c.env.DB.batch([
+      c.env.DB.prepare('DELETE FROM saved_ideas WHERE user_id = ?').bind(userId),
+      c.env.DB.prepare('DELETE FROM deep_dive_usage WHERE user_id = ?').bind(userId),
+      c.env.DB.prepare('DELETE FROM app_requests WHERE user_id = ?').bind(userId),
+      c.env.DB.prepare('DELETE FROM users WHERE id = ?').bind(userId),
+    ])
+
+    return c.json({ message: 'Account deleted' })
+  } catch (error) {
+    console.error('Account deletion error:', error)
+    return c.json({ error: 'Account deletion failed', detail: String(error) }, 500)
+  }
+})
+
 // アプリ追跡リクエスト（認証必須）
 app.post('/api/apps/request', async (c, next) => {
   const mw = authMiddleware(c.env.JWT_SECRET)
@@ -586,7 +611,8 @@ export default {
   async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
     // どのCronスケジュールが起動したかで処理を分ける
     // "*/15 * * * *" = 感情分析ファストレーン（15分ごと・少量）
-    // それ以外（"0 */6 * * *"）= フルパイプライン（6時間ごと）
+    // "0 */3 * * *"  = ペインポイント生成（3時間ごと・専用）
+    // それ以外（"0 */6 * * *"）= レビュー取得 + 感情分析
     if (controller.cron === '*/15 * * * *') {
       // 【高頻度・15分ごと】感情分析だけを安全な少量（40件）で処理。
       // 40件はレート制限（約48件）の内側なので、ほぼ全件成功する。
@@ -605,8 +631,28 @@ export default {
       return
     }
 
-    // 【6時間ごと】フルパイプライン: レビュー取得 → 感情分析 → ペインポイント生成
-    console.log('Cron (full pipeline) started:', new Date().toISOString())
+    if (controller.cron === '0 */3 * * *') {
+      // 【3時間ごと・専用レーン】ペインポイント生成だけを単独で実行。
+      // 以前はフルパイプラインの最後にあり、前段が長引くと生成まで届かず
+      // 増えなかった。専用Cronに分離して確実に回す。5アプリ/回。
+      // 「ペインポイントが少ないアプリ優先」なので、回るたび手つかずのアプリが掘られる。
+      console.log('Cron (pain point generation) started:', new Date().toISOString())
+      ctx.waitUntil(
+        (async () => {
+          try {
+            const r = await generatePainPoints(env.DB, env.AI, 5)
+            console.log('Pain point generation:', JSON.stringify(r))
+          } catch (err) {
+            console.error('Pain point generation error:', err)
+          }
+        })()
+      )
+      return
+    }
+
+    // 【6時間ごと】レビュー取得 + 感情分析
+    // （ペインポイント生成は上の専用Cronが担当するのでここでは行わない）
+    console.log('Cron (fetch + sentiment) started:', new Date().toISOString())
     ctx.waitUntil(
       (async () => {
         try {
@@ -617,10 +663,6 @@ export default {
           // Step 2: 感情分析（安全な少量。バルク消化は15分ごとのファストレーンが担当）
           const sentimentResult = await analyzeSentiment(env.DB, env.AI, 40)
           console.log('Cron Step 2 (sentiment):', JSON.stringify(sentimentResult))
-
-          // Step 3: ペインポイント生成（最大10アプリ）
-          const painPointResult = await generatePainPoints(env.DB, env.AI, 10)
-          console.log('Cron Step 3 (pain points):', JSON.stringify(painPointResult))
 
           console.log('Cron job completed successfully')
         } catch (err) {
