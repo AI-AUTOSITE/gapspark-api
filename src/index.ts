@@ -6,6 +6,8 @@ import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityS
 import { getDeepDive, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
 import { unifiedSearch, getPopularTopics, getAppsByTopic, getPainPointsByTopic } from './search'
 import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
+import { runMonitor, sendTestEmail, sendWeeklyReportNow } from './monitor'
+import { recordDailySnapshot, getDashboardData } from './dashboard'
 
 // Cloudflare Workers の環境変数型定義
 type Bindings = {
@@ -14,6 +16,7 @@ type Bindings = {
   CLAUDE_API_KEY: string
   JWT_SECRET: string        // 自前JWT署名用シークレット
   APPLE_BUNDLE_ID: string   // Apple Bundle ID（例: com.gapspark.app）
+  RESEND_API_KEY: string    // Resend APIキー（運用監視メール用・secret）
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: AuthVariables }>()
@@ -230,6 +233,18 @@ app.get('/api/trends', async (c) => {
       LIMIT 20
     `).all()
     return c.json({ trends: result.results })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ダッシュボード用の集計データ（公開・読み取り専用）
+// サブドメインのダッシュボードHTMLがここを取得して表示する。
+// 既存の app.use('/*', cors()) によりCORSは許可済み（読み取り専用・認証情報なし）。
+app.get('/api/dashboard', async (c) => {
+  try {
+    const data = await getDashboardData(c.env.DB)
+    return c.json(data)
   } catch (error) {
     return c.json({ error: String(error) }, 500)
   }
@@ -512,6 +527,31 @@ app.get('/api/debug/generate-pain-points', async (c) => {
   })
 })
 
+// 監視: テストメール（Resendが動くかの確認。叩くと即送信）
+app.get('/api/debug/send-test-email', async (c) => {
+  const sent = await sendTestEmail(c.env)
+  return c.json({ sent })
+})
+
+// 監視: 週報を今すぐ送る（中身の確認用。叩くと即送信）
+app.get('/api/debug/send-weekly-report', async (c) => {
+  const sent = await sendWeeklyReportNow(c.env)
+  return c.json({ sent })
+})
+
+// 監視: 監視ロジックを今すぐ実行（評価結果をJSONで返す。条件を満たせばメール送信）
+app.get('/api/debug/run-monitor', async (c) => {
+  const result = await runMonitor(c.env)
+  return c.json(result)
+})
+
+// ダッシュボード: スナップショットを今すぐ記録（推移グラフ用・手動テスト）
+// 初回はこれを1回叩いておくと、推移グラフに最初の点が入る。
+app.get('/api/debug/record-snapshot', async (c) => {
+  const recorded = await recordDailySnapshot(c.env.DB)
+  return c.json({ recorded })
+})
+
 // 4. 全パイプライン実行（NEW — Cronと同じ処理を手動実行）
 app.get('/api/debug/run-pipeline', async (c) => {
   console.log('Manual full pipeline triggered')
@@ -667,6 +707,32 @@ export default {
           console.log('Cron job completed successfully')
         } catch (err) {
           console.error('Cron error:', err)
+        }
+      })()
+    )
+
+    // 運用監視（週報＋アラート）。6時間ごとに評価し、必要なときだけメールを送る。
+    // 取得/分析とは独立して実行（互いに影響しないよう別の waitUntil にする）。
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const r = await runMonitor(env)
+          console.log('Monitor:', JSON.stringify(r))
+        } catch (err) {
+          console.error('Monitor error:', err)
+        }
+      })()
+    )
+
+    // ダッシュボード用の日次スナップショット記録（推移グラフ用）。
+    // snapshot_date でUPSERTするので、6時間ごとに呼んでも1日1行（その日の最新値で上書き）。
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const r = await recordDailySnapshot(env.DB)
+          console.log('Snapshot:', JSON.stringify(r))
+        } catch (err) {
+          console.error('Snapshot error:', err)
         }
       })()
     )

@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex" />
+<title>GapSpark Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0F1419;
+    --card: #161D26;
+    --card2: #1B2530;
+    --border: rgba(255,255,255,0.08);
+    --text: #E8EDF2;
+    --muted: #8A97A6;
+    --accent: #FFCC00;
+    --green: #34D399;
+    --blue: #60A5FA;
+    --red: #F87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 8px; }
+  .title { display: flex; align-items: center; gap: 12px; }
+  .dot { width: 30px; height: 30px; border-radius: 9px; background: var(--accent); display: inline-flex; align-items: center; justify-content: center; font-weight: 800; color: #0F1419; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; margin: 2px 0 0; }
+  .controls { display: flex; align-items: center; gap: 10px; }
+  button {
+    background: var(--card2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 10px; padding: 8px 14px; font-size: 13px; cursor: pointer; transition: background .15s;
+  }
+  button:hover { background: #243040; }
+
+  .grid { display: grid; gap: 16px; }
+  .cards { grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 22px 0; }
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 28px; font-weight: 800; margin-top: 6px; letter-spacing: -0.02em; }
+  .card .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .accent { color: var(--accent); }
+  .green { color: var(--green); }
+  .blue { color: var(--blue); }
+  .red { color: var(--red); }
+
+  .panels { grid-template-columns: 1fr 1fr; }
+  @media (max-width: 760px) { .panels { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 18px 20px;
+  }
+  .panel h2 { font-size: 14px; margin: 0 0 14px; font-weight: 700; color: var(--text); }
+  .panel .chartbox { position: relative; height: 260px; }
+  .full { grid-column: 1 / -1; }
+
+  ul.recent { list-style: none; margin: 0; padding: 0; }
+  ul.recent li { display: flex; align-items: center; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--border); }
+  ul.recent li:last-child { border-bottom: none; }
+  .sev { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .pp-title { flex: 1; font-size: 14px; }
+  .pp-cat { color: var(--muted); font-size: 12px; }
+  .pp-date { color: var(--muted); font-size: 12px; white-space: nowrap; }
+
+  .loading, .error { text-align: center; color: var(--muted); padding: 60px 20px; }
+  .error { color: var(--red); }
+  .legendnote { color: var(--muted); font-size: 11px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="title">
+      <span class="dot">G</span>
+      <div>
+        <h1>GapSpark Dashboard</h1>
+        <p class="sub" id="updated">読み込み中…</p>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="refresh">↻ 更新</button>
+    </div>
+  </header>
+
+  <div id="content">
+    <div class="loading">データを読み込んでいます…</div>
+  </div>
+</div>
+
+<script>
+  // ===== ここだけ環境に合わせて変更可 =====
+  const API = "https://gapspark-api.pricedrop-app.workers.dev/api/dashboard";
+  // ========================================
+
+  Chart.defaults.color = "#8A97A6";
+  Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+  Chart.defaults.borderColor = "rgba(255,255,255,0.06)";
+
+  let charts = [];
+  function destroyCharts() { charts.forEach(c => c.destroy()); charts = []; }
+
+  function fmt(n) { return (n ?? 0).toLocaleString("en-US"); }
+  function fmtDate(s) {
+    if (!s) return "";
+    const d = new Date(String(s).replace(" ", "T") + "Z");
+    if (isNaN(d)) return String(s).slice(0, 10);
+    return d.toLocaleDateString("ja-JP", { month: "numeric", day: "numeric" });
+  }
+  // severity_score を色に（高いほど赤）
+  function sevColor(s) {
+    if (s >= 0.66) return "#F87171";
+    if (s >= 0.33) return "#FBBF24";
+    return "#34D399";
+  }
+
+  function card(label, value, meta, cls) {
+    return `<div class="card">
+      <div class="label">${label}</div>
+      <div class="value ${cls || ""}">${value}</div>
+      ${meta ? `<div class="meta">${meta}</div>` : ""}
+    </div>`;
+  }
+
+  function render(d) {
+    const s = d.summary;
+    const cards = `
+      <div class="grid cards">
+        ${card("ペインポイント", fmt(s.pain_points), "ユーザーの不満から抽出", "accent")}
+        ${card("分析済み", s.analyzed_pct + "%", fmt(s.analyzed) + " / " + fmt(s.total_reviews) + " 件", "green")}
+        ${card("総レビュー", fmt(s.total_reviews), fmt(s.tracked_apps) + " アプリを追跡")}
+        ${card("ネガティブ", fmt(s.negative), "（アイデアの源泉）", "red")}
+        ${card("ポジティブ", fmt(s.positive), "", "blue")}
+      </div>`;
+
+    const panels = `
+      <div class="grid panels">
+        <div class="panel full">
+          <h2>推移：ペインポイント数 ＆ 分析進捗(%)</h2>
+          <div class="chartbox"><canvas id="trend"></canvas></div>
+          <div class="legendnote">※ 推移は記録開始日から1日1点ずつ増えていきます（最初は点が少なくても正常です）。</div>
+        </div>
+        <div class="panel">
+          <h2>レビュー消化の推移</h2>
+          <div class="chartbox"><canvas id="volume"></canvas></div>
+        </div>
+        <div class="panel">
+          <h2>カテゴリ別ペインポイント分布</h2>
+          <div class="chartbox"><canvas id="cats"></canvas></div>
+        </div>
+        <div class="panel full">
+          <h2>最近追加されたペインポイント</h2>
+          <ul class="recent">
+            ${(d.recent_pain_points || []).map(pp => `
+              <li>
+                <span class="sev" style="background:${sevColor(pp.severity_score)}"></span>
+                <span class="pp-title">${escapeHtml(pp.title)} <span class="pp-cat">· ${escapeHtml(pp.category)}</span></span>
+                <span class="pp-date">${fmtDate(pp.created_at)}</span>
+              </li>`).join("")}
+          </ul>
+        </div>
+      </div>`;
+
+    document.getElementById("content").innerHTML = cards + panels;
+    document.getElementById("updated").textContent =
+      "最終更新: " + new Date(d.updated).toLocaleString("ja-JP");
+
+    drawCharts(d);
+  }
+
+  function drawCharts(d) {
+    destroyCharts();
+    const trend = d.trend || [];
+    const labels = trend.map(t => fmtDate(t.snapshot_date));
+    const ppData = trend.map(t => t.pain_point_count);
+    const pctData = trend.map(t => t.total_reviews > 0 ? Math.round((t.analyzed_count / t.total_reviews) * 100) : 0);
+
+    // 推移: PP数（左軸・棒）＋ 分析%（右軸・線）
+    charts.push(new Chart(document.getElementById("trend"), {
+      data: {
+        labels,
+        datasets: [
+          { type: "bar", label: "ペインポイント数", data: ppData, yAxisID: "y",
+            backgroundColor: "rgba(255,204,0,0.55)", borderRadius: 4, order: 2 },
+          { type: "line", label: "分析進捗 (%)", data: pctData, yAxisID: "y1",
+            borderColor: "#34D399", backgroundColor: "#34D399", tension: 0.3, pointRadius: 2, order: 1 }
+        ]
+      },
+      options: {
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        scales: {
+          y:  { position: "left", beginAtZero: true, title: { display: true, text: "PP数" } },
+          y1: { position: "right", beginAtZero: true, max: 100, grid: { drawOnChartArea: false }, title: { display: true, text: "分析 %" } }
+        },
+        plugins: { legend: { labels: { boxWidth: 12 } } }
+      }
+    }));
+
+    // レビュー消化: 総レビュー vs 分析済み（同スケール）
+    charts.push(new Chart(document.getElementById("volume"), {
+      type: "line",
+      data: {
+        labels,
+        datasets: [
+          { label: "総レビュー", data: trend.map(t => t.total_reviews),
+            borderColor: "#60A5FA", backgroundColor: "rgba(96,165,250,0.12)", fill: true, tension: 0.3, pointRadius: 0 },
+          { label: "分析済み", data: trend.map(t => t.analyzed_count),
+            borderColor: "#34D399", backgroundColor: "rgba(52,211,153,0.12)", fill: true, tension: 0.3, pointRadius: 0 }
+        ]
+      },
+      options: {
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        scales: { y: { beginAtZero: true } },
+        plugins: { legend: { labels: { boxWidth: 12 } } }
+      }
+    }));
+
+    // カテゴリ分布: doughnut
+    const cats = d.categories || [];
+    const palette = ["#FFCC00","#60A5FA","#34D399","#F87171","#A78BFA","#FB923C","#22D3EE","#F472B6","#4ADE80","#FBBF24"];
+    charts.push(new Chart(document.getElementById("cats"), {
+      type: "doughnut",
+      data: {
+        labels: cats.map(c => c.category),
+        datasets: [{ data: cats.map(c => c.count), backgroundColor: cats.map((_, i) => palette[i % palette.length]), borderColor: "#161D26", borderWidth: 2 }]
+      },
+      options: {
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "right", labels: { boxWidth: 12, padding: 10 } } }
+      }
+    }));
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[m]));
+  }
+
+  async function load() {
+    try {
+      const res = await fetch(API, { cache: "no-store" });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      render(data);
+    } catch (e) {
+      document.getElementById("content").innerHTML =
+        `<div class="error">データを取得できませんでした（${escapeHtml(e.message)}）。<br>APIのURLを確認してください。</div>`;
+      document.getElementById("updated").textContent = "取得エラー";
+    }
+  }
+
+  document.getElementById("refresh").addEventListener("click", load);
+  load();
+  // 5分ごとに自動更新
+  setInterval(load, 5 * 60 * 1000);
+</script>
+</body>
+</html>
