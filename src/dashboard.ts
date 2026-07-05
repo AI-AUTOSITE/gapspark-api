@@ -11,9 +11,10 @@ type Counts = {
   positive: number
   pain_points: number
   apps: number
+  deep_dives: number
 }
 
-// reviews / pain_points / tracked_apps の現在のカウントを1往復で取得
+// reviews / pain_points / tracked_apps / deep_dives の現在のカウントを1往復で取得
 // （health・monitor と同じ定義: analyzed = sentiment_score IS NOT NULL）
 async function getCounts(db: D1Database): Promise<Counts> {
   const row = await db.prepare(`
@@ -23,7 +24,8 @@ async function getCounts(db: D1Database): Promise<Counts> {
       (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'NEGATIVE') AS negative,
       (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'POSITIVE') AS positive,
       (SELECT COUNT(*) FROM pain_points) AS pain_points,
-      (SELECT COUNT(*) FROM tracked_apps) AS apps
+      (SELECT COUNT(*) FROM tracked_apps) AS apps,
+      (SELECT COUNT(*) FROM deep_dives) AS deep_dives
   `).first<Record<string, number>>()
   return {
     total: row?.total ?? 0,
@@ -32,6 +34,7 @@ async function getCounts(db: D1Database): Promise<Counts> {
     positive: row?.positive ?? 0,
     pain_points: row?.pain_points ?? 0,
     apps: row?.apps ?? 0,
+    deep_dives: row?.deep_dives ?? 0,
   }
 }
 
@@ -108,6 +111,7 @@ export async function getDashboardData(db: D1Database): Promise<Record<string, u
       positive: c.positive,
       pain_points: c.pain_points,
       tracked_apps: c.apps,
+      deep_dives: c.deep_dives,
     },
     trend: trend.results ?? [],
     categories: categories.results ?? [],

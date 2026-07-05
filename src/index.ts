@@ -1,13 +1,15 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
-import { fetchAndStoreReviews } from './cron/fetch-reviews'
+import { fetchAndStoreReviews, deepBackfillReviews } from './cron/fetch-reviews'
+import { fetchHackerNewsMentions } from './cron/fetch-hackernews'
 import { analyzeSentiment } from './cron/analyze-sentiment'
-import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores } from './cron/generate-pain-points'
-import { getDeepDive, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
+import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal } from './cron/generate-pain-points'
+import { getDeepDive, getCachedDeepDive, getDeepDivedPainPointIds, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
 import { unifiedSearch, getPopularTopics, getAppsByTopic, getPainPointsByTopic } from './search'
 import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
 import { runMonitor, sendTestEmail, sendWeeklyReportNow } from './monitor'
 import { recordDailySnapshot, getDashboardData } from './dashboard'
+import { verifySubscription, applyProEntitlement, getUserSubscription, handleAppStoreNotification } from './subscription'
 
 // Cloudflare Workers の環境変数型定義
 type Bindings = {
@@ -17,6 +19,10 @@ type Bindings = {
   JWT_SECRET: string        // 自前JWT署名用シークレット
   APPLE_BUNDLE_ID: string   // Apple Bundle ID（例: com.gapspark.app）
   RESEND_API_KEY: string    // Resend APIキー（運用監視メール用・secret）
+  // ↓ サブスク検証（App Store Server API）。すべて wrangler secret put で設定
+  APPSTORE_ISSUER_ID: string   // App Store Connect API の Issuer ID
+  APPSTORE_KEY_ID: string      // 生成したAPIキーの Key ID
+  APPSTORE_PRIVATE_KEY: string // .p8 の中身（PEM全体）
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: AuthVariables }>()
@@ -142,6 +148,19 @@ app.get('/api/pain-points', async (c) => {
     return c.json({ pain_points: result.results })
   } catch (error) {
     return c.json({ error: String(error) }, 500)
+  }
+})
+
+// Deep Dive済みのペインポイントID一覧（Discoverの「Analyzed」バッジ用・認証不要）
+// ※ /:id より前に登録すること（"deep-dived-ids" が :id に食われないように）
+app.get('/api/pain-points/deep-dived-ids', async (c) => {
+  try {
+    const ids = await getDeepDivedPainPointIds(c.env.DB)
+    return c.json({ ids })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('deep-dived-ids error:', error)
+    return c.json({ error: 'Failed to fetch analyzed IDs', detail: message }, 500)
   }
 })
 
@@ -315,16 +334,23 @@ app.get('/api/pain-points/:id/deep-dive', async (c, next) => {
       painPointId
     )
 
-    // キャッシュヒットでもカウント（ユーザー体験上の公平性）
-    await recordDeepDiveUsage(c.env.DB, userId)
+    // キャッシュヒット（再表示）はカウントしない。新規生成のときだけ1回記録する。
+    if (!cached) {
+      await recordDeepDiveUsage(c.env.DB, userId)
+    }
+
+    // キャッシュヒット時はカウント増えないので used も remaining も据え置き。
+    // Pro（limit=-1）は常に無制限。
+    const increment = cached ? 0 : 1
+    const remaining = limit.limit < 0 ? -1 : limit.limit - limit.used - increment
 
     return c.json({
       deep_dive: result,
       cached,
       usage: {
-        used: limit.used + 1,
+        used: limit.used + increment,
         limit: limit.limit,
-        remaining: limit.limit - limit.used - 1
+        remaining
       }
     })
   } catch (error) {
@@ -334,6 +360,69 @@ app.get('/api/pain-points/:id/deep-dive', async (c, next) => {
     }
     console.error('Deep Dive error:', error)
     return c.json({ error: 'Deep Dive analysis failed', detail: message }, 500)
+  }
+})
+
+// 分析済みDeep Diveをキャッシュから返す（カウントも生成もしない。UIの「分析済み」判定・再表示用）
+// 未分析なら deep_dive: null を返す。
+app.get('/api/pain-points/:id/deep-dive/cached', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const painPointId = parseInt(c.req.param('id'))
+    if (isNaN(painPointId)) {
+      return c.json({ error: 'Invalid pain point ID' }, 400)
+    }
+
+    const result = await getCachedDeepDive(c.env.DB, painPointId)
+    return c.json({ deep_dive: result })   // 未分析なら null
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('Deep Dive cached fetch error:', error)
+    return c.json({ error: 'Failed to fetch cached Deep Dive', detail: message }, 500)
+  }
+})
+
+// フリープランの残り回数（Deep Diveボタン付近の表示用・認証必須）
+// Pro は limit=-1 / remaining=-1（無制限）を返す。
+app.get('/api/user/deep-dive-usage', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const limit = await checkDeepDiveLimit(c.env.DB, userId)
+    const remaining = limit.limit < 0 ? -1 : Math.max(0, limit.limit - limit.used)
+    return c.json({ used: limit.used, limit: limit.limit, remaining, pro: limit.pro })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('deep-dive-usage error:', error)
+    return c.json({ error: 'Failed to fetch usage', detail: message }, 500)
+  }
+})
+
+// App Store Server Notifications V2（Appleがサブスクの更新/解約/返金/失効を通知してくる）
+// 認証なし（Appleが叩くため）。署名の代わりに App Store Server API で再検証して users を同期する。
+// 一時的な処理失敗時は 500 を返して Apple に再送させる（それ以外は 200）。
+// このURLを App Store Connect → App Information → App Store Server Notifications に登録する。
+app.post('/api/apple/notifications', async (c) => {
+  let body: { signedPayload?: string }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'Invalid JSON' }, 400)
+  }
+  if (!body?.signedPayload) {
+    return c.json({ error: 'Missing signedPayload' }, 400)
+  }
+
+  try {
+    const result = await handleAppStoreNotification(c.env.DB, c.env, body.signedPayload)
+    return c.json({ ok: true, ...result }) // 200
+  } catch (error) {
+    console.error('App Store notification processing failed (will retry):', error)
+    return c.json({ ok: false }, 500) // Apple が再送
   }
 })
 
@@ -490,6 +579,63 @@ app.get('/api/user/requests', async (c, next) => {
 })
 
 // ========================================
+// サブスクリプション（GapSpark Pro）
+// ========================================
+
+// 購入した権利をサーバーに同期（認証必須）
+// iOS が transactionId + jws + environment を送る → App Store Server API で検証 → Pro反映
+app.post('/api/user/subscription', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const body = await c.req.json() as {
+      transaction_id?: string
+      jws?: string
+      environment?: string
+    }
+
+    if (!body.transaction_id) {
+      return c.json({ error: 'transaction_id is required' }, 400)
+    }
+
+    // App Store Server API で検証
+    const verified = await verifySubscription(
+      c.env,
+      body.transaction_id,
+      body.environment || 'Production'
+    )
+
+    // 有効なら Pro を反映（無効なら何もしない = 保存済み期限で自動判定）
+    if (verified.active) {
+      await applyProEntitlement(c.env.DB, userId, verified)
+    }
+
+    const status = await getUserSubscription(c.env.DB, userId)
+    return c.json(status)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('Subscription sync error:', message)
+    return c.json({ error: 'Subscription verification failed', detail: message }, 500)
+  }
+})
+
+// サブスク状態の取得（認証必須）
+app.get('/api/user/subscription', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const status = await getUserSubscription(c.env.DB, userId)
+    return c.json(status)
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// ========================================
 // デバッグ用エンドポイント（手動テスト）
 // ========================================
 
@@ -499,6 +645,31 @@ app.get('/api/debug/fetch-reviews', async (c) => {
   const result = await fetchAndStoreReviews(c.env.DB)
   return c.json({
     message: 'Review fetch completed',
+    ...result
+  })
+})
+
+// 深掘りバックフィル（過去分レビュー pages 2+ の一度きりキャッチアップ）
+// signal backfill と同じチャンク方式。?offset= を進めて done=true まで繰り返す。
+app.get('/api/debug/deep-fetch', async (c) => {
+  const offset = parseInt(c.req.query('offset') || '0') || 0
+  console.log(`Deep fetch backfill triggered (offset=${offset})`)
+  const result = await deepBackfillReviews(c.env.DB, offset)
+  return c.json({
+    message: 'Deep fetch chunk completed',
+    ...result
+  })
+})
+
+// Hacker News からアプリ言及コメントを取得（Apple RSS とは別の新データ源）
+// reviews に region='hackernews' で保存 → 既存の sentiment / pain-point パイプラインが自動処理。
+// チャンク方式: ?offset= を進めて done=true まで繰り返す。
+app.get('/api/debug/fetch-hn', async (c) => {
+  const offset = parseInt(c.req.query('offset') || '0') || 0
+  console.log(`Hacker News fetch triggered (offset=${offset})`)
+  const result = await fetchHackerNewsMentions(c.env.DB, offset)
+  return c.json({
+    message: 'Hacker News fetch chunk completed',
     ...result
   })
 })
@@ -619,6 +790,34 @@ app.get('/api/debug/recalculate-severity', async (c) => {
   const result = await recalculateSeverityScores(c.env.DB)
   return c.json({
     message: 'Severity recalculation completed',
+    ...result
+  })
+})
+
+// 9. 弱信号ペインポイントのクリーンアップ（2件未満の裏付けを削除）
+//    安全のためデフォルトは dry run（削除せず件数だけ表示）。
+//    実際に削除するには ?confirm=true を付ける。
+app.get('/api/debug/cleanup-weak-pain-points', async (c) => {
+  const confirm = c.req.query('confirm') === 'true'
+  console.log(`Weak-signal cleanup triggered (confirm=${confirm})`)
+  const result = await cleanupWeaklySupportedPainPoints(c.env.DB, !confirm)
+  return c.json({
+    message: confirm
+      ? 'Weak-signal pain points deleted'
+      : 'DRY RUN — nothing deleted. Add ?confirm=true to actually delete.',
+    ...result
+  })
+})
+
+// 10. 案B: 信号強度(mention_count / sample_size)を既存ペインに一括計算
+//     分割実行: 1回20件ずつ処理して next_offset を返す。done=true まで繰り返す。
+//     例: /api/debug/backfill-signal?offset=0 → offset=20 → offset=40 ...
+app.get('/api/debug/backfill-signal', async (c) => {
+  const offset = parseInt(c.req.query('offset') || '0') || 0
+  console.log(`Signal backfill triggered (offset=${offset})`)
+  const result = await backfillMentionSignal(c.env.DB, offset)
+  return c.json({
+    message: 'Signal backfill chunk completed',
     ...result
   })
 })

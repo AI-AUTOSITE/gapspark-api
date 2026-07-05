@@ -36,6 +36,7 @@ interface ExtractedPainPoint {
 interface ScoredPainPoint extends ExtractedPainPoint {
   ruleBasedScore: number
   reviewCount: number
+  matchingReviewCount: number  // 純粋なキーワード一致レビュー数（足切り判定用）
 }
 
 interface ExistingPainPoint {
@@ -207,10 +208,20 @@ export async function generatePainPoints(
         console.log(`    Quality filter: ${unique.length} → ${quality.length}`)
       }
 
-      if (quality.length > 0) {
-        const saved = await savePainPoints(db, app, quality)
+      // 信号強度フィルタ: キーワードが2件未満のレビューにしか出ない
+      // ペインポイントは「ノイズ（1人だけの複合的な不満）」とみなして捨てる。
+      // これで Discover に "1件由来の弱いペインポイント" が残らなくなる。
+      const MIN_SUPPORTING_REVIEWS = 2
+      const wellSupported = quality.filter(pp => pp.matchingReviewCount >= MIN_SUPPORTING_REVIEWS)
+
+      if (wellSupported.length < quality.length) {
+        console.log(`    Signal filter: ${quality.length} → ${wellSupported.length} (dropped weakly-supported <${MIN_SUPPORTING_REVIEWS} reviews)`)
+      }
+
+      if (wellSupported.length > 0) {
+        const saved = await savePainPoints(db, app, wellSupported)
         painPointsCreated += saved
-        quality.forEach(pp => {
+        wellSupported.forEach(pp => {
           globalTitles.push(pp.title)
           globalSummaries.push(pp.summary)
         })
@@ -266,6 +277,7 @@ function applyRuleBasedScoring(
     const text = `${r.title} ${r.body}`.toLowerCase()
     return ppKeywords.some(k => text.includes(k))
   })
+  const matchingReviewCount = matchingReviews.length  // 純粋な一致数（足切り用）
   const reviewCount = Math.max(matchingReviews.length, batchReviews.length)
   const frequencyWeight = Math.log(1 + reviewCount) / Math.log(1 + allReviews.length)
 
@@ -288,7 +300,7 @@ function applyRuleBasedScoring(
   const rawScore = starPenalty * keywordSeverity * frequencyWeight * recencyBoost
   const ruleBasedScore = Math.round(Math.min(1.0, Math.max(0.05, rawScore)) * 100) / 100
 
-  return { ...pp, ruleBasedScore, reviewCount }
+  return { ...pp, ruleBasedScore, reviewCount, matchingReviewCount }
 }
 
 
@@ -453,6 +465,114 @@ function validatePainPoints(points: any[]): ExtractedPainPoint[] {
     }))
 }
 
+// ========================================
+// 案B: 信号強度（Signal Strength）
+// ========================================
+//
+// バッジ用の「信号の強さ」を計算する。
+// v2設計変更: 当初は「15件中◯件」(上限15)だったが、アプリのネガレビューは数百件あり
+//   話題語でもすぐ15件に達して 86% が 15/15 に飽和した（＝強弱を見分けられない）。
+//   → 上限を撤廃し「実数マグニチュード」に変更:
+//
+//   mention_count: 対象アプリのネガレビュー中、検索語のいずれかを含む実件数（上限なし。例 8, 34, 127）
+//   sample_size:   対象アプリのネガレビュー総数（上限なし）= 母集団
+//                  → 割合 mention_count / sample_size = 「そのアプリの不満のうち何%がこの問題か」
+//   両方 0 のとき = 計算不能（検索語なし / アプリ紐付けなし）→ UI はバッジ非表示にできる
+//
+// UI（Stage 3）は実数 or 割合を強度バー(Low/Mid/High)等で表示する。
+//
+// ※ 生成時（savePainPoints）とバックフィル（backfillMentionSignal）の両方が
+//   この computeSignal を呼ぶので、値が食い違わない（1つの真実）。
+
+// 汎用語リスト（ほぼ全ネガレビューに出る語）。信号カウントから除外する。
+// 例: "app" はほとんどのレビューにヒットするので、含めると mention_count が15に張り付き、
+//     バッジが信号の強弱を見分けられなくなる。意味のある（そのペイン固有の）語だけで数える。
+// 複数語キーワード（"won't open" 等）は単語トークンと一致しないので除外されない＝残る（良い）。
+const GENERIC_TERMS = new Set([
+  // プラットフォーム・アプリそのもの
+  'app', 'apps', 'application', 'applications',
+  'ios', 'android', 'iphone', 'iphones', 'ipad', 'ipads',
+  'phone', 'phones', 'device', 'devices', 'mobile', 'tablet',
+  // バージョン・アップデート系
+  'version', 'versions', 'update', 'updates', 'updated', 'upgrade', 'upgrades',
+  // 超汎用の不満フィラー
+  'work', 'works', 'working', 'worked', 'use', 'used', 'uses', 'using',
+  'please', 'fix', 'fixed', 'fixes', 'get', 'gets', 'getting', 'got',
+  'thing', 'things', 'time', 'times', 'way', 'ways',
+  'want', 'wants', 'need', 'needs', 'make', 'makes', 'made',
+  'really', 'even', 'back', 'still', 'since', 'every', 'always', 'never',
+  'this', 'that', 'with', 'from', 'have', 'just', 'they', 'your', 'when', 'what',
+])
+
+// deep-dive.ts の Stage 1 と同じ検索語の作り方（＋汎用語の除外）：
+// keywords（小文字化）+ タイトルから抽出した4文字以上の語 を重複除去。
+// そこから汎用語(GENERIC_TERMS)を除いて、最大6語。
+// ※ Deep Dive 側の照合ロジックも後で同じ除外に揃える（バッジと Deep Dive の一致を保つため）。
+function deriveSearchTerms(keywords: string[], title: string): string[] {
+  const titleTerms = (title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 4)
+
+  const all = Array.from(
+    new Set([
+      // 2文字以下のキーワード("ad"→"bad","read"等に誤爆)は substring 一致で飽和するので除外
+      ...keywords.map(k => k.toLowerCase()).filter(k => k.length >= 3),
+      ...titleTerms,
+    ])
+  )
+
+  // 汎用語を除外して「そのペイン固有の語」だけにする
+  const distinctive = all.filter(t => !GENERIC_TERMS.has(t))
+
+  // まれに全部除外される（汎用語だけのペイン）→ 0件表示を避けるため元の語にフォールバック
+  const terms = distinctive.length > 0 ? distinctive : all
+  return terms.slice(0, 6)
+}
+
+// 信号強度を計算（DBクエリ。対象アプリの全ネガレビューを見るので生成/バックフィルで一致）
+async function computeSignal(
+  db: D1Database,
+  appIds: number[],
+  keywords: string[],
+  title: string
+): Promise<{ mentionCount: number; sampleSize: number }> {
+  const searchTerms = deriveSearchTerms(keywords, title)
+  if (searchTerms.length === 0 || appIds.length === 0) {
+    return { mentionCount: 0, sampleSize: 0 }
+  }
+
+  const placeholders = appIds.map(() => '?').join(',')
+  const likeClauses = searchTerms
+    .map(() => '(LOWER(r.title) LIKE ? OR LOWER(r.body) LIKE ?)')
+    .join(' OR ')
+  const likeParams = searchTerms.flatMap(t => {
+    const kw = `%${t.toLowerCase()}%`
+    return [kw, kw]
+  })
+
+  // 言及件数（検索語のいずれかにマッチ = OR）
+  const mentionRow = await db.prepare(`
+    SELECT COUNT(*) as cnt FROM reviews r
+    WHERE r.tracked_app_id IN (${placeholders})
+      AND r.sentiment_label = 'NEGATIVE'
+      AND (${likeClauses})
+  `).bind(...appIds, ...likeParams).first<{ cnt: number }>()
+
+  // 母数（対象アプリのネガレビュー総数）
+  const totalRow = await db.prepare(`
+    SELECT COUNT(*) as cnt FROM reviews r
+    WHERE r.tracked_app_id IN (${placeholders})
+      AND r.sentiment_label = 'NEGATIVE'
+  `).bind(...appIds).first<{ cnt: number }>()
+
+  return {
+    mentionCount: mentionRow?.cnt || 0,   // 上限なし（実一致数）
+    sampleSize: totalRow?.cnt || 0,        // 上限なし（アプリの総ネガ数 = 母集団）
+  }
+}
+
 async function savePainPoints(
   db: D1Database,
   app: AppWithReviews & { negative_count?: number },
@@ -460,23 +580,32 @@ async function savePainPoints(
 ): Promise<number> {
   const insertStmt = db.prepare(`
     INSERT INTO pain_points 
-    (category, title, summary, severity_score, frequency, sample_app_ids, keywords, related_topics, ai_generated_idea, ai_model_used, last_updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'workers-ai-llama-3.2-1b', datetime('now'))
+    (category, title, summary, severity_score, frequency, sample_app_ids, keywords, related_topics, ai_generated_idea, mention_count, sample_size, ai_model_used, last_updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'workers-ai-llama-3.2-1b', datetime('now'))
   `)
 
-  const batch = painPoints.map(pp => 
-    insertStmt.bind(
-      app.category,
-      pp.title,
-      pp.summary,
-      pp.ruleBasedScore,    // ← ルールベーススコア
-      pp.reviewCount,        // ← 実際の該当レビュー数
-      JSON.stringify([app.app_id]),
-      JSON.stringify(pp.keywords),
-      JSON.stringify(pp.related_topics),
-      pp.ai_generated_idea
+  const appIds = [app.app_id]
+
+  // 各ペインの信号強度を先に計算（Deep Dive と同じ照合ロジック）してから INSERT
+  const batch: D1PreparedStatement[] = []
+  for (const pp of painPoints) {
+    const signal = await computeSignal(db, appIds, pp.keywords, pp.title)
+    batch.push(
+      insertStmt.bind(
+        app.category,
+        pp.title,
+        pp.summary,
+        pp.ruleBasedScore,    // ← ルールベーススコア
+        pp.reviewCount,        // ← 実際の該当レビュー数（severity用・従来通り）
+        JSON.stringify(appIds),
+        JSON.stringify(pp.keywords),
+        JSON.stringify(pp.related_topics),
+        pp.ai_generated_idea,
+        signal.mentionCount,   // ← 案B: 言及件数
+        signal.sampleSize      // ← 案B: 母数
+      )
     )
-  )
+  }
 
   try {
     const results = await db.batch(batch)
@@ -543,6 +672,81 @@ export async function deduplicateExistingPainPoints(
   const remaining = total - idsToDelete.length
   console.log(`Dedup: ${total} → ${remaining} (${idsToDelete.length} removed)`)
   return { total, removed: idsToDelete.length, remaining }
+}
+
+
+/**
+ * 既存ペインポイントの「弱信号」クリーンアップ。
+ * キーワードが2件未満のネガティブレビューにしか出現しないペインポイントを削除する。
+ * （新しい生成ロジックの足切りと同じ基準を、過去データにも適用する用）
+ *
+ * dryRun=true の場合は削除せず、削除対象の件数だけ返す（安全確認用）。
+ */
+export async function cleanupWeaklySupportedPainPoints(
+  db: D1Database,
+  dryRun: boolean = true,
+  minSupportingReviews: number = 2
+): Promise<{ total: number; weaklySupported: number; deleted: number; dryRun: boolean }> {
+  const all = await db.prepare(
+    'SELECT id, title, keywords, sample_app_ids FROM pain_points'
+  ).all<{ id: number; title: string; keywords: string; sample_app_ids: string }>()
+
+  if (!all.results || all.results.length === 0) {
+    return { total: 0, weaklySupported: 0, deleted: 0, dryRun }
+  }
+
+  const total = all.results.length
+  const idsToDelete: number[] = []
+
+  for (const pp of all.results) {
+    try {
+      const keywords = JSON.parse(pp.keywords || '[]') as string[]
+      const appIds = JSON.parse(pp.sample_app_ids || '[]') as number[]
+
+      // キーワードが無い / アプリ紐付けが無いものは判定不能 → 残す（安全側）
+      if (keywords.length === 0 || appIds.length === 0) continue
+
+      // このペインのキーワードが何件のネガティブレビューに出るか数える
+      // （いずれかのキーワードにマッチ = OR 条件）
+      const likeClauses = keywords.slice(0, 6).map(() => '(LOWER(r.title) LIKE ? OR LOWER(r.body) LIKE ?)').join(' OR ')
+      const likeParams = keywords.slice(0, 6).flatMap(k => {
+        const kw = `%${k.toLowerCase()}%`
+        return [kw, kw]
+      })
+      const placeholders = appIds.map(() => '?').join(',')
+
+      const countRow = await db.prepare(`
+        SELECT COUNT(*) as cnt
+        FROM reviews r
+        WHERE r.tracked_app_id IN (${placeholders})
+          AND r.sentiment_label = 'NEGATIVE'
+          AND (${likeClauses})
+      `).bind(...appIds, ...likeParams).first<{ cnt: number }>()
+
+      const supporting = countRow?.cnt || 0
+      if (supporting < minSupportingReviews) {
+        idsToDelete.push(pp.id)
+      }
+    } catch (e) {
+      console.error(`  Error checking PP ${pp.id}:`, e)
+      // エラー時は残す（安全側）
+    }
+  }
+
+  const weaklySupported = idsToDelete.length
+
+  if (!dryRun && idsToDelete.length > 0) {
+    console.log(`Deleting ${idsToDelete.length} weakly-supported pain points...`)
+    for (let i = 0; i < idsToDelete.length; i += 50) {
+      const batchIds = idsToDelete.slice(i, i + 50)
+      const ph = batchIds.map(() => '?').join(',')
+      await db.prepare(`DELETE FROM pain_points WHERE id IN (${ph})`).bind(...batchIds).run()
+    }
+  }
+
+  const deleted = dryRun ? 0 : weaklySupported
+  console.log(`Weak-signal cleanup: total=${total}, weak=${weaklySupported}, deleted=${deleted}, dryRun=${dryRun}`)
+  return { total, weaklySupported, deleted, dryRun }
 }
 
 
@@ -630,4 +834,74 @@ export async function recalculateSeverityScores(
 
   console.log(`Severity recalculation: ${updated} updated, ${errors} errors`)
   return { updated, errors }
+}
+
+
+/**
+ * 案B: 既存ペインポイントに mention_count / sample_size を一括計算して埋める。
+ * migration 0005 適用直後に一度だけ実行すればよい（新規生成分は savePainPoints が自動で埋める）。
+ * 生成時と同じ computeSignal を使うので値が一致する。
+ *
+ * ★分割実行★
+ * 全ペインを1リクエストで処理すると、1件あたり2回のD1クエリ×数百件 = 数百〜千回の
+ * 逐次サブリクエストになり、Cloudflare Worker の上限（無料枠 50 サブリクエスト）や
+ * 実行時間を超えて返ってこなくなる。そこで 1回 CHUNK 件ずつ処理し、次の offset を返す。
+ * 呼び出し側は done=true になるまで offset を進めて繰り返し叩く（Python ループで自動化）。
+ */
+export async function backfillMentionSignal(
+  db: D1Database,
+  offset: number = 0
+): Promise<{
+  total: number
+  offset: number
+  processed: number
+  updated: number
+  errors: number
+  done: boolean
+  next_offset: number
+}> {
+  // 1リクエストで処理する件数。2クエリ/件なので 20×2=40 + 数回 で無料枠50に収まる。
+  const CHUNK = 20
+
+  const totalRow = await db.prepare(
+    'SELECT COUNT(*) as cnt FROM pain_points'
+  ).first<{ cnt: number }>()
+  const total = totalRow?.cnt || 0
+
+  // このチャンク分のペインだけ取得（id 昇順で安定ページング）
+  const painPoints = await db.prepare(
+    'SELECT id, title, keywords, sample_app_ids FROM pain_points ORDER BY id LIMIT ? OFFSET ?'
+  ).bind(CHUNK, offset).all<{ id: number; title: string; keywords: string; sample_app_ids: string }>()
+
+  const rows = painPoints.results || []
+  let errors = 0
+  const updateStmt = db.prepare(
+    'UPDATE pain_points SET mention_count = ?, sample_size = ? WHERE id = ?'
+  )
+  const batchUpdates: D1PreparedStatement[] = []
+
+  for (const pp of rows) {
+    try {
+      const keywords = JSON.parse(pp.keywords || '[]') as string[]
+      const appIds = JSON.parse(pp.sample_app_ids || '[]') as number[]
+      const signal = await computeSignal(db, appIds, keywords, pp.title)
+      batchUpdates.push(updateStmt.bind(signal.mentionCount, signal.sampleSize, pp.id))
+    } catch (e) {
+      console.error(`  Error backfilling signal for PP ${pp.id}:`, e)
+      errors++
+    }
+  }
+
+  let updated = 0
+  if (batchUpdates.length > 0) {
+    await db.batch(batchUpdates)
+    updated = batchUpdates.length
+  }
+
+  const processed = rows.length
+  const next_offset = offset + processed
+  const done = next_offset >= total || processed === 0
+
+  console.log(`Signal backfill chunk: offset=${offset}, processed=${processed}, updated=${updated}, errors=${errors}, total=${total}, done=${done}`)
+  return { total, offset, processed, updated, errors, done, next_offset }
 }

@@ -98,9 +98,9 @@ function decisionTableHtml(): string {
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
     <tr style="background:#f0f0f0"><th>数字</th><th>状態</th><th>やること</th></tr>
     <tr><td rowspan="2">分析の進捗</td><td>90%未満</td><td>何もしない（自動で進む）</td></tr>
-    <tr><td>90%以上</td><td>「深掘り」を検討（レビュー2ページ目以降を取得）</td></tr>
+    <tr><td>90%以上</td><td>新データ源を追加（Hacker News）or アプリ追加</td></tr>
     <tr><td rowspan="2">新規ペインポイント</td><td>まだ増えてる</td><td>何もしない</td></tr>
-    <tr><td>数日増えない</td><td>アプリ追加 or 深掘り</td></tr>
+    <tr><td>数日増えない</td><td>アプリ追加 or Hacker News 取得</td></tr>
     <tr><td rowspan="2">分析が止まってないか</td><td>増えてる</td><td>OK（正常）</td></tr>
     <tr><td>増えてない</td><td>要調査（Cron停止/エラーの可能性）</td></tr>
   </table>`
@@ -112,7 +112,7 @@ function weeklyReportHtml(stats: Stats, prevAnalyzed: number | null, prevPP: num
   const dPP = prevPP != null ? stats.painPoints - prevPP : null
   let recommend = 'OK 順調です。何もしなくて大丈夫。自動でデータが育っています。'
   if (ratio >= 90) {
-    recommend = '注意: 分析がほぼ完了しています。そろそろ「深掘り（レビュー2ページ目以降の取得）」を検討する時期です。'
+    recommend = '注意: 分析がほぼ完了しています。Apple RSS は最新約50件のフィードで過去分ページングは不可なので、新データ源（Hacker News）やアプリ追加で新しいペインポイントを増やす時期です。'
   }
   return `
   <div style="font-family:sans-serif;max-width:640px">
@@ -199,11 +199,11 @@ export async function runMonitor(env: MonitorEnv): Promise<Record<string, unknow
     const last = await getState(db, 'last_exhaustion_alert')
     if (!last || daysBetween(last, today) >= ALERT_COOLDOWN_DAYS) {
       const html = alertHtml(
-        'アプリ追加 or 深掘りの時期です',
-        `分析が${Math.round(ratio * 100)}%まで進み、ペインポイントが${ppFlatDays}日間増えていません。今のアプリからは新しいペインポイントがほぼ出尽くした可能性があります。「深掘り（レビュー2ページ目以降の取得）」か「アプリ追加」を検討してください。`,
+        'アプリ追加 or 新データ源の時期です',
+        `分析が${Math.round(ratio * 100)}%まで進み、ペインポイントが${ppFlatDays}日間増えていません。今のアプリからは新しいペインポイントがほぼ出尽くした可能性があります。Apple RSS は最新フィードのみで過去分は取れないため、「Hacker News など新データ源の取得」か「アプリ追加」を検討してください。`,
         stats
       )
-      if (await sendEmail(env.RESEND_API_KEY, 'GapSpark: アプリ追加/深掘りの時期です', html)) {
+      if (await sendEmail(env.RESEND_API_KEY, 'GapSpark: アプリ追加/新データ源の時期です', html)) {
         await setState(db, 'last_exhaustion_alert', today)
         actions.push('exhaustion_alert_sent')
       }

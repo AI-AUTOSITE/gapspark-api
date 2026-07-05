@@ -52,6 +52,7 @@
   .green { color: var(--green); }
   .blue { color: var(--blue); }
   .red { color: var(--red); }
+  .purple { color: #A78BFA; }
 
   .panels { grid-template-columns: 1fr 1fr; }
   @media (max-width: 760px) { .panels { grid-template-columns: 1fr; } }
@@ -134,6 +135,7 @@
     const cards = `
       <div class="grid cards">
         ${card("Pain Points", fmt(s.pain_points), "Surfaced from user complaints", "accent")}
+        ${card("Deep Dives", fmt(s.deep_dives), "Claude AI analyses generated", "purple")}
         ${card("Analyzed", s.analyzed_pct + "%", fmt(s.analyzed) + " / " + fmt(s.total_reviews) + " reviews", "green")}
         ${card("Total Reviews", fmt(s.total_reviews), fmt(s.tracked_apps) + " apps tracked")}
         ${card("Negative", fmt(s.negative), "(idea source)", "red")}
@@ -169,8 +171,17 @@
       </div>`;
 
     document.getElementById("content").innerHTML = cards + panels;
+    function timeAgo(ts) {
+      const m = Math.floor((Date.now() - ts) / 60000);
+      if (m < 1) return "just now";
+      if (m < 60) return m + " min ago";
+      const h = Math.floor(m / 60);
+      if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+      const dd = Math.floor(h / 24);
+      return dd + (dd === 1 ? " day ago" : " days ago");
+    }
     document.getElementById("updated").textContent =
-      "Last updated: " + new Date(d.updated).toLocaleString("en-US");
+      "Updated " + timeAgo(d.updated) + " · " + new Date(d.updated).toLocaleString("en-US");
 
     drawCharts(d);
   }
