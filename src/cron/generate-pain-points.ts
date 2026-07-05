@@ -966,3 +966,59 @@ export async function backfillRelatedTopics(
   console.log(`Related topics backfill: total=${total} updated=${updated}`)
   return { total, updated }
 }
+
+
+// ai_generated_idea の先頭（"AppName — concept" の AppName 部分）を取り出す。
+// iOS の extractAppName と同じロジック。取れなければ null。
+function extractAppNameFromIdea(idea: string): string | null {
+  for (const sep of ['—', ' – ', ' - ', ':']) {
+    const idx = idea.indexOf(sep)
+    if (idx > 0) {
+      const name = idea.slice(0, idx).trim()
+      if (name.length >= 2 && name.length <= 40) return name
+    }
+  }
+  return null
+}
+
+/**
+ * 既存の保存アイデアで idea_title が汎用の "App Idea"（FM非対応端末のフォールバック）に
+ * なっているものを、紐づくペインポイントの ai_generated_idea から実アプリ名に置き換える。
+ * Llama 不使用・neuron 消費ゼロ・1回で完結。
+ */
+export async function backfillIdeaTitles(
+  db: D1Database
+): Promise<{ total: number; updated: number }> {
+  const rows = await db
+    .prepare(
+      `SELECT si.id AS id, pp.ai_generated_idea AS idea
+       FROM saved_ideas si
+       JOIN pain_points pp ON si.pain_point_id = pp.id
+       WHERE si.idea_title = 'App Idea'`
+    )
+    .all<{ id: number; idea: string | null }>()
+
+  if (!rows.results || rows.results.length === 0) {
+    return { total: 0, updated: 0 }
+  }
+
+  const total = rows.results.length
+  const updateStmt = db.prepare('UPDATE saved_ideas SET idea_title = ? WHERE id = ?')
+  const batch: D1PreparedStatement[] = []
+
+  for (const row of rows.results) {
+    const name = row.idea ? extractAppNameFromIdea(row.idea) : null
+    if (name) {
+      batch.push(updateStmt.bind(name, row.id))
+    }
+  }
+
+  let updated = 0
+  if (batch.length > 0) {
+    await db.batch(batch)
+    updated = batch.length
+  }
+
+  console.log(`Idea titles backfill: total(App Idea)=${total} updated=${updated}`)
+  return { total, updated }
+}

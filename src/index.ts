@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { fetchAndStoreReviews, deepBackfillReviews } from './cron/fetch-reviews'
 import { fetchHackerNewsMentions, runHackerNewsCron } from './cron/fetch-hackernews'
 import { analyzeSentiment } from './cron/analyze-sentiment'
-import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal, backfillRelatedTopics } from './cron/generate-pain-points'
+import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal, backfillRelatedTopics, backfillIdeaTitles } from './cron/generate-pain-points'
 import { getDeepDive, getCachedDeepDive, getDeepDivedPainPointIds, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
 import { unifiedSearch, getPopularTopics, getAppsByTopic, getPainPointsByTopic } from './search'
 import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
@@ -829,6 +829,17 @@ app.get('/api/debug/backfill-topics', async (c) => {
   const result = await backfillRelatedTopics(c.env.DB)
   return c.json({
     message: 'Related topics backfill completed',
+    ...result
+  })
+})
+
+// 既存の保存アイデアで idea_title が "App Idea" のものを ai_generated_idea から実名に置換
+// （FM非対応端末で保存した分の修復）。Llama不使用・neuron消費ゼロ・1回で完結。
+app.get('/api/debug/backfill-idea-titles', async (c) => {
+  console.log('Idea titles backfill triggered')
+  const result = await backfillIdeaTitles(c.env.DB)
+  return c.json({
+    message: 'Idea titles backfill completed',
     ...result
   })
 })
