@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { fetchAndStoreReviews, deepBackfillReviews } from './cron/fetch-reviews'
 import { fetchHackerNewsMentions, runHackerNewsCron } from './cron/fetch-hackernews'
 import { analyzeSentiment } from './cron/analyze-sentiment'
-import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal } from './cron/generate-pain-points'
+import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal, backfillRelatedTopics } from './cron/generate-pain-points'
 import { getDeepDive, getCachedDeepDive, getDeepDivedPainPointIds, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
 import { unifiedSearch, getPopularTopics, getAppsByTopic, getPainPointsByTopic } from './search'
 import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
@@ -818,6 +818,17 @@ app.get('/api/debug/backfill-signal', async (c) => {
   const result = await backfillMentionSignal(c.env.DB, offset)
   return c.json({
     message: 'Signal backfill chunk completed',
+    ...result
+  })
+})
+
+// 既存ペインの related_topics を keywords からトピック語に作り直す（"feature_category"等を除去）
+// Llama不使用・neuron消費ゼロ・1回で完結。
+app.get('/api/debug/backfill-topics', async (c) => {
+  console.log('Related topics backfill triggered')
+  const result = await backfillRelatedTopics(c.env.DB)
+  return c.json({
+    message: 'Related topics backfill completed',
     ...result
   })
 })

@@ -331,7 +331,7 @@ JSON array only:
     "title": "Specific problem in 5-10 words (BAD: 'App crashes' / GOOD: 'App crashes when opening PDF attachments')",
     "summary": "2-3 sentences: What exactly frustrates users? How does it affect their workflow? Be specific about the trigger and impact.",
     "keywords": ["specific", "complaint", "terms", "from", "reviews"],
-    "related_topics": ["feature_category", "use_case"],
+    "related_topics": ["topic1", "topic2"],
     "severity": "critical|high|medium|low",
     "ai_generated_idea": "AppName — A one-sentence app concept that solves this problem as a new product. Target: who would pay for it."
   }
@@ -341,7 +341,7 @@ Rules:
 - critical=crash/data loss, high=feature broken, medium=UX frustration, low=feature wish
 - Title MUST name the specific trigger or context (not just 'crashes' but 'crashes when...')
 - ai_generated_idea must be a NEW app name + concept, not 'fix ${app.app_name}'
-- related_topics: lowercase tags like "sync", "pdf", "offline", "notifications"
+- related_topics: 2-3 lowercase topical tags describing the theme, like "sync", "offline", "notifications", "search" (NOT meta-labels like "feature_category" or "use_case")
 - JSON only. No markdown, no explanation.`
 
   const result = await ai.run('@cf/meta/llama-3.2-1b-instruct', {
@@ -449,6 +449,12 @@ function parseLlamaResponse(response: string): ExtractedPainPoint[] {
   return []
 }
 
+// related_topics に紛れ込むメタラベル（トピックじゃない語）。パース時に除去する保険。
+const RELATED_TOPIC_DENYLIST = new Set([
+  'feature_category', 'use_case', 'usecase', 'topic1', 'topic2',
+  'category', 'feature', 'topic', 'tag', 'tags', 'theme', 'area', 'type',
+])
+
 function validatePainPoints(points: any[]): ExtractedPainPoint[] {
   return points
     .filter(p => p && typeof p.title === 'string' && typeof p.summary === 'string')
@@ -456,8 +462,12 @@ function validatePainPoints(points: any[]): ExtractedPainPoint[] {
       title: String(p.title).substring(0, 100),
       summary: String(p.summary).substring(0, 500),
       keywords: Array.isArray(p.keywords) ? p.keywords.map(String).slice(0, 10) : [],
-      related_topics: Array.isArray(p.related_topics) 
-        ? p.related_topics.map((t: any) => String(t).toLowerCase()).slice(0, 5) 
+      related_topics: Array.isArray(p.related_topics)
+        ? p.related_topics
+            .map((t: any) => String(t).toLowerCase().trim())
+            // メタラベル・空・短すぎる語を除去（プロンプト修正の保険）
+            .filter((t: string) => t.length >= 2 && !RELATED_TOPIC_DENYLIST.has(t))
+            .slice(0, 5)
         : [],
       severity: ['critical', 'high', 'medium', 'low'].includes(p.severity) ? p.severity : 'medium',
       ai_generated_idea: typeof p.ai_generated_idea === 'string' 
@@ -904,4 +914,55 @@ export async function backfillMentionSignal(
 
   console.log(`Signal backfill chunk: offset=${offset}, processed=${processed}, updated=${updated}, errors=${errors}, total=${total}, done=${done}`)
   return { total, offset, processed, updated, errors, done, next_offset }
+}
+
+
+/**
+ * 既存ペインポイントの related_topics を keywords から作り直す（一度きり）。
+ * プロンプト修正は新規ペインにしか効かないので、過去分の "feature_category" 等の
+ * メタラベルをトピック語に置き換える。Llama 不使用（keywordsから導出）＝neuron 消費ゼロ。
+ * ペイン数は数百程度なので1リクエストで完結（チャンク不要）。
+ */
+export async function backfillRelatedTopics(
+  db: D1Database
+): Promise<{ total: number; updated: number }> {
+  const rows = await db
+    .prepare('SELECT id, title, keywords FROM pain_points')
+    .all<{ id: number; title: string; keywords: string }>()
+
+  if (!rows.results || rows.results.length === 0) {
+    return { total: 0, updated: 0 }
+  }
+
+  const total = rows.results.length
+  const updateStmt = db.prepare('UPDATE pain_points SET related_topics = ? WHERE id = ?')
+  let batch: D1PreparedStatement[] = []
+  let updated = 0
+
+  for (const pp of rows.results) {
+    try {
+      const keywords = JSON.parse(pp.keywords || '[]') as string[]
+      // keywords から汎用語(GENERIC_TERMS)・メタラベルを除いたトピック語を上位4件
+      const topics = deriveSearchTerms(keywords, pp.title)
+        .filter((t) => !RELATED_TOPIC_DENYLIST.has(t))
+        .slice(0, 4)
+      batch.push(updateStmt.bind(JSON.stringify(topics), pp.id))
+
+      if (batch.length >= 50) {
+        await db.batch(batch)
+        updated += batch.length
+        batch = []
+      }
+    } catch (e) {
+      console.error(`  related_topics backfill error for PP ${pp.id}:`, e)
+    }
+  }
+
+  if (batch.length > 0) {
+    await db.batch(batch)
+    updated += batch.length
+  }
+
+  console.log(`Related topics backfill: total=${total} updated=${updated}`)
+  return { total, updated }
 }
