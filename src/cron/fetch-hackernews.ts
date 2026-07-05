@@ -112,7 +112,13 @@ export async function fetchHackerNewsMentions(
      VALUES (?, ?, ?, 3, ?, ?, '', 'hackernews', ?)`
   )
 
-  let newComments = 0
+  // 実際の新規挿入数は INSERT OR IGNORE 前後の行数差で正確に測る
+  // （D1 の batch() の meta.changes は挿入行数と一致しないため使わない）
+  const beforeRow = await db
+    .prepare("SELECT COUNT(*) as cnt FROM reviews WHERE region = 'hackernews'")
+    .first<{ cnt: number }>()
+  const before = beforeRow?.cnt || 0
+
   for (const app of rows) {
     const brand = brandName(app.app_name)
     if (brand.length < 2) {
@@ -135,17 +141,18 @@ export async function fetchHackerNewsMentions(
           c.createdAt
         )
       )
-      const batchResults = await db.batch(batch)
-      const inserted = batchResults.reduce((sum, r) => sum + (r.meta?.changes || 0), 0)
-      newComments += inserted
-      console.log(`  HN "${brand}": ${relevant.length} relevant, +${inserted} new`)
-    } else {
-      console.log(`  HN "${brand}": 0 relevant`)
+      await db.batch(batch)
     }
+    console.log(`  HN "${brand}": ${relevant.length} relevant matches`)
 
     // HN Algolia へのレート配慮
     await new Promise((r) => setTimeout(r, 700))
   }
+
+  const afterRow = await db
+    .prepare("SELECT COUNT(*) as cnt FROM reviews WHERE region = 'hackernews'")
+    .first<{ cnt: number }>()
+  const newComments = (afterRow?.cnt || 0) - before
 
   const processed = rows.length
   const next_offset = offset + processed
@@ -155,4 +162,33 @@ export async function fetchHackerNewsMentions(
     `HN backfill: offset=${offset} processed=${processed} newComments=${newComments} total=${total} done=${done}`
   )
   return { total, offset, processed, newComments, done, next_offset }
+}
+
+
+// cron用: monitor_state の 'hn_offset' を使って全アプリを巡回しながら少しずつHN取得する。
+// 6時間ごとに HN_CHUNK 件ずつ進み、末尾に達したら 0 に巻き戻す（54アプリなら約3日で一巡）。
+// マイグレーション不要（monitor_state の key-value を再利用）。
+export async function runHackerNewsCron(
+  db: D1Database
+): Promise<{ offset: number; nextOffset: number; newComments: number; done: boolean }> {
+  // 現在の巡回位置を取得
+  const stateRow = await db
+    .prepare("SELECT value FROM monitor_state WHERE key = 'hn_offset'")
+    .first<{ value: string }>()
+  const offset = parseInt(stateRow?.value || '0') || 0
+
+  const result = await fetchHackerNewsMentions(db, offset)
+
+  // 次の位置（末尾=done なら 0 に巻き戻して巡回を継続）
+  const nextOffset = result.done ? 0 : result.next_offset
+  await db
+    .prepare(
+      "INSERT INTO monitor_state (key, value, updated_at) VALUES ('hn_offset', ?, datetime('now')) " +
+        'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+    )
+    .bind(String(nextOffset))
+    .run()
+
+  console.log(`HN cron: offset=${offset} -> next=${nextOffset} newComments=${result.newComments}`)
+  return { offset, nextOffset, newComments: result.newComments, done: result.done }
 }

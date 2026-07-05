@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { fetchAndStoreReviews, deepBackfillReviews } from './cron/fetch-reviews'
-import { fetchHackerNewsMentions } from './cron/fetch-hackernews'
+import { fetchHackerNewsMentions, runHackerNewsCron } from './cron/fetch-hackernews'
 import { analyzeSentiment } from './cron/analyze-sentiment'
 import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal } from './cron/generate-pain-points'
 import { getDeepDive, getCachedDeepDive, getDeepDivedPainPointIds, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
@@ -906,6 +906,19 @@ export default {
           console.log('Cron job completed successfully')
         } catch (err) {
           console.error('Cron error:', err)
+        }
+      })()
+    )
+
+    // Hacker News 取得（巡回・6時間ごとに少量ずつ全アプリを一巡）。
+    // 取得/分析とは独立して実行（互いに影響しないよう別の waitUntil にする）。
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const hn = await runHackerNewsCron(env.DB)
+          console.log('Cron Step 3 (hacker news):', JSON.stringify(hn))
+        } catch (err) {
+          console.error('Hacker News cron error:', err)
         }
       })()
     )
