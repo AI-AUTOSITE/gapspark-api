@@ -1,17 +1,89 @@
-name: Fetch Reviews (test)
+name: Fetch Reviews to D1
 
 on:
-  workflow_dispatch:   # 手動で実行できるようにする（まずはテスト用）
+  schedule:
+    - cron: '0 */6 * * *'   # 6時間ごとに自動実行
+  workflow_dispatch:          # 手動実行も可能（テスト用）
 
 jobs:
-  test-fetch:
+  fetch-and-load:
     runs-on: ubuntu-latest
     steps:
-      - name: Apple RSS が取れるかテスト
+      - name: レビュー取得 → SQL生成 → D1書き込み
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          DB_ID: ${{ secrets.CF_DATABASE_ID }}
         run: |
-          for id in 1016366447 363590051; do
-            RESULT=$(curl -s -A "Mozilla/5.0" "https://itunes.apple.com/us/rss/customerreviews/page=1/id=${id}/sortBy=mostRecent/json")
-            COUNT=$(echo "$RESULT" | python3 -c "import sys,json; e=json.load(sys.stdin).get('feed',{}).get('entry'); print(len(e) if isinstance(e,list) else 0)")
-            echo "App ${id}: ${COUNT} reviews"
-          done
-          echo "--- 50前後なら成功 / 0ならGitHubのIPも弾かれている ---"
+          set -e
+
+          # ① D1から追跡中アプリのID一覧を取得（apple_id と 内部id）
+          echo "==> 追跡アプリ一覧を取得中..."
+          npx -y wrangler d1 execute gapspark-db --remote \
+            --command "SELECT id, apple_id FROM tracked_apps" --json > apps.json
+
+          # ② 各アプリのレビューをApple RSSから取得し、50行ずつのSQLに変換
+          python3 << 'PYEOF'
+          import json, subprocess, urllib.parse, time, re, os
+
+          apps = json.load(open("apps.json"))[0]["results"]
+          print(f"==> {len(apps)} アプリのレビューを取得します")
+
+          def esc(s):
+              if s is None: return ""
+              s = str(s).replace("'", "''")
+              return re.sub(r"\s+", " ", s).strip()
+
+          rows = []
+          for a in apps:
+              aid = a["apple_id"]
+              tid = a["id"]
+              url = f"https://itunes.apple.com/us/rss/customerreviews/page=1/id={aid}/sortby=mostrecent/json"
+              try:
+                  raw = subprocess.run(["curl","-s","-A","Mozilla/5.0",url],
+                                       capture_output=True, text=True, timeout=25).stdout
+                  entries = json.loads(raw).get("feed",{}).get("entry")
+                  if not isinstance(entries, list): entries = []
+                  entries = entries[1:]  # 先頭はアプリ情報
+              except Exception:
+                  entries = []
+              for r in entries:
+                  try:
+                      rid = r["id"]["label"]
+                      author = r.get("author",{}).get("name",{}).get("label","")
+                      rating = int(r.get("im:rating",{}).get("label","0") or 0)
+                      title = r.get("title",{}).get("label","")
+                      body = r.get("content",{}).get("label","")
+                      ver = r.get("im:version",{}).get("label","")
+                      date = r.get("updated",{}).get("label","")
+                      rows.append(
+                          f"({tid}, '{esc(rid)}', '{esc(author)}', {rating}, "
+                          f"'{esc(title)}', '{esc(body)}', '{esc(ver)}', 'us', '{esc(date)}')"
+                      )
+                  except Exception:
+                      pass
+              time.sleep(0.5)
+
+          print(f"==> 取得レビュー総数: {len(rows)}")
+
+          # 50行ずつの複数INSERTに分割（D1のstatement長制限対策）
+          COLS = "(tracked_app_id, review_id, author, rating, title, body, app_version, region, review_date)"
+          BATCH = 50
+          out = []
+          for i in range(0, len(rows), BATCH):
+              chunk = rows[i:i+BATCH]
+              out.append(f"INSERT OR IGNORE INTO reviews {COLS} VALUES")
+              out.append(",\n".join(chunk) + ";")
+          with open("reviews.sql","w") as f:
+              f.write("\n".join(out) + "\n")
+          print(f"==> SQL生成完了: {(len(rows)+BATCH-1)//BATCH} 個のINSERT文")
+          PYEOF
+
+          # ③ 生成したSQLをD1に流し込む（重複はINSERT OR IGNOREで自動スキップ）
+          if [ -s reviews.sql ]; then
+            echo "==> D1に書き込み中..."
+            npx -y wrangler d1 execute gapspark-db --remote --file reviews.sql
+            echo "==> 完了！"
+          else
+            echo "==> 取得0件。今回はスキップ。"
+          fi
