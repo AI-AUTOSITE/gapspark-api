@@ -1,0 +1,17 @@
+name: Fetch Reviews (test)
+
+on:
+  workflow_dispatch:   # 手動で実行できるようにする（まずはテスト用）
+
+jobs:
+  test-fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apple RSS が取れるかテスト
+        run: |
+          for id in 1016366447 363590051; do
+            RESULT=$(curl -s -A "Mozilla/5.0" "https://itunes.apple.com/us/rss/customerreviews/page=1/id=${id}/sortBy=mostRecent/json")
+            COUNT=$(echo "$RESULT" | python3 -c "import sys,json; e=json.load(sys.stdin).get('feed',{}).get('entry'); print(len(e) if isinstance(e,list) else 0)")
+            echo "App ${id}: ${COUNT} reviews"
+          done
+          echo "--- 50前後なら成功 / 0ならGitHubのIPも弾かれている ---"
