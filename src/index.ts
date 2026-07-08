@@ -181,13 +181,25 @@ app.get('/api/pain-points/:id', async (c) => {
 app.get('/api/apps', async (c) => {
   try {
     const { category } = c.req.query()
-    let query = 'SELECT * FROM tracked_apps'
+    // ペインポイントが1件以上あるアプリだけ返す。
+    // 追加直後でまだ生成されていない「空アプリ」を Discover から隠す。
+    // → 各アプリはペインが付いた瞬間に自動で再表示される（自己修復。戻す作業は不要）。
+    let query = `
+      SELECT * FROM tracked_apps ta
+      WHERE EXISTS (
+        SELECT 1 FROM pain_points pp
+        WHERE EXISTS (
+          SELECT 1 FROM json_each(pp.sample_app_ids)
+          WHERE json_each.value = ta.id
+        )
+      )
+    `
     const params: string[] = []
     if (category) {
-      query += ' WHERE category = ?'
+      query += ' AND ta.category = ?'
       params.push(category)
     }
-    query += ' ORDER BY app_name ASC'
+    query += ' ORDER BY ta.app_name ASC'
     const stmt = params.length > 0
       ? c.env.DB.prepare(query).bind(...params)
       : c.env.DB.prepare(query)

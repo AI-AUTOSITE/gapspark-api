@@ -179,11 +179,20 @@ async function searchApps(
         )
       ) as pain_point_count
     FROM tracked_apps ta
-    WHERE ta.app_name LIKE ?1
-      OR ta.category LIKE ?1
-      OR EXISTS (
-        SELECT 1 FROM json_each(ta.tags) 
-        WHERE LOWER(json_each.value) LIKE ?1
+    WHERE (
+        ta.app_name LIKE ?1
+        OR ta.category LIKE ?1
+        OR EXISTS (
+          SELECT 1 FROM json_each(ta.tags) 
+          WHERE LOWER(json_each.value) LIKE ?1
+        )
+      )
+      AND EXISTS (
+        SELECT 1 FROM pain_points pp
+        WHERE EXISTS (
+          SELECT 1 FROM json_each(pp.sample_app_ids)
+          WHERE json_each.value = ta.id
+        )
       )
     ORDER BY pain_point_count DESC, ta.app_name ASC
     LIMIT 10

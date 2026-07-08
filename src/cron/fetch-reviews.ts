@@ -49,7 +49,14 @@ async function fetchAppReviews(appleId: string, page: number = 1): Promise<RawRe
   const url = `https://itunes.apple.com/us/rss/customerreviews/page=${page}/id=${appleId}/sortBy=mostRecent/json`
 
   try {
-    const res = await fetch(url)
+    // ブラウザのUser-Agentを付ける。これが無いと Apple がサーバー(Worker)からの
+    // リクエストに空フィードを返すことがある（Mac/curl では取れるのに Worker では空、の対策）。
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+        'Accept': 'application/json',
+      },
+    })
     if (!res.ok) {
       console.error(`  HTTP ${res.status} for app ${appleId}`)
       return []
@@ -61,7 +68,6 @@ async function fetchAppReviews(appleId: string, page: number = 1): Promise<RawRe
     return []
   }
 }
-
 // 全トラッキングアプリのレビューを取得してD1に保存
 export async function fetchAndStoreReviews(db: D1Database): Promise<{
   appsProcessed: number
