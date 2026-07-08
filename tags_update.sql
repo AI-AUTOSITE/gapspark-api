@@ -1,0 +1,38 @@
+-- tags_update.sql : 追加36アプリに手動タグを付与（Discoverのタグ検索対応）
+-- 既存54アプリと同じ「小文字トピック語」方式。1アプリ1 UPDATE文。
+UPDATE tracked_apps SET tags='["notes", "markdown", "writing", "organization"]' WHERE apple_id='1016366447';
+UPDATE tracked_apps SET tags='["notes", "markdown", "knowledge", "linking"]' WHERE apple_id='1557175442';
+UPDATE tracked_apps SET tags='["notes", "handwriting", "pdf", "annotation"]' WHERE apple_id='1444383602';
+UPDATE tracked_apps SET tags='["notes", "handwriting", "pdf", "audio"]' WHERE apple_id='360593530';
+UPDATE tracked_apps SET tags='["notes", "calendar", "planning", "projects"]' WHERE apple_id='1370289240';
+UPDATE tracked_apps SET tags='["tasks", "todo", "productivity", "gtd"]' WHERE apple_id='904237743';
+UPDATE tracked_apps SET tags='["tasks", "todo", "calendar", "reminders"]' WHERE apple_id='626144601';
+UPDATE tracked_apps SET tags='["calendar", "scheduling", "events", "reminders"]' WHERE apple_id='718043190';
+UPDATE tracked_apps SET tags='["focus", "productivity", "timer", "pomodoro"]' WHERE apple_id='866450515';
+UPDATE tracked_apps SET tags='["planner", "schedule", "todo", "timeblocking"]' WHERE apple_id='1499198946';
+UPDATE tracked_apps SET tags='["habits", "gamification", "productivity", "tasks"]' WHERE apple_id='994882113';
+UPDATE tracked_apps SET tags='["habits", "tracker", "routine", "goals"]' WHERE apple_id='1103961876';
+UPDATE tracked_apps SET tags='["journal", "diary", "writing", "memories"]' WHERE apple_id='1044867788';
+UPDATE tracked_apps SET tags='["self-care", "habits", "wellness", "mental-health"]' WHERE apple_id='1528595748';
+UPDATE tracked_apps SET tags='["habits", "routine", "wellness", "coaching"]' WHERE apple_id='1203637303';
+UPDATE tracked_apps SET tags='["journal", "mental-health", "mood", "wellness"]' WHERE apple_id='1312926037';
+UPDATE tracked_apps SET tags='["podcast", "audio", "listening"]' WHERE apple_id='888422857';
+UPDATE tracked_apps SET tags='["podcast", "audio", "listening"]' WHERE apple_id='414834813';
+UPDATE tracked_apps SET tags='["rss", "news", "reader", "feeds"]' WHERE apple_id='510153374';
+UPDATE tracked_apps SET tags='["read-later", "highlights", "articles", "reading"]' WHERE apple_id='1567599761';
+UPDATE tracked_apps SET tags='["read-later", "articles", "reading", "newsletter"]' WHERE apple_id='1501592184';
+UPDATE tracked_apps SET tags='["budget", "finance", "money", "spending"]' WHERE apple_id='1447330651';
+UPDATE tracked_apps SET tags='["budget", "finance", "money", "networth"]' WHERE apple_id='1459319842';
+UPDATE tracked_apps SET tags='["budget", "finance", "subscriptions", "bills"]' WHERE apple_id='1130616675';
+UPDATE tracked_apps SET tags='["budget", "finance", "money", "spending"]' WHERE apple_id='949414211';
+UPDATE tracked_apps SET tags='["sleep", "tracking", "health", "watch"]' WHERE apple_id='1164801111';
+UPDATE tracked_apps SET tags='["fasting", "health", "nutrition", "tracking"]' WHERE apple_id='1168348542';
+UPDATE tracked_apps SET tags='["nutrition", "calories", "diet", "tracking"]' WHERE apple_id='1145935738';
+UPDATE tracked_apps SET tags='["fitness", "workout", "health", "tracking"]' WHERE apple_id='1576857102';
+UPDATE tracked_apps SET tags='["camera", "photography", "photo"]' WHERE apple_id='885697368';
+UPDATE tracked_apps SET tags='["photo", "editing", "video", "camera"]' WHERE apple_id='953286746';
+UPDATE tracked_apps SET tags='["drawing", "art", "illustration", "painting"]' WHERE apple_id='916366645';
+UPDATE tracked_apps SET tags='["photo", "editing", "filters", "camera"]' WHERE apple_id='588013838';
+UPDATE tracked_apps SET tags='["git", "code", "developer", "version-control"]' WHERE apple_id='896694807';
+UPDATE tracked_apps SET tags='["automation", "scripting", "javascript", "shortcuts"]' WHERE apple_id='1405459188';
+UPDATE tracked_apps SET tags='["automation", "shortcuts", "notifications"]' WHERE apple_id='1450936447';
