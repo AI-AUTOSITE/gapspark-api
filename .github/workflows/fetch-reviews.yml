@@ -3,87 +3,124 @@ name: Fetch Reviews to D1
 on:
   schedule:
     - cron: '0 */6 * * *'   # 6時間ごとに自動実行
-  workflow_dispatch:          # 手動実行も可能（テスト用）
+  workflow_dispatch:          # 手動実行も可能
 
 jobs:
   fetch-and-load:
     runs-on: ubuntu-latest
     steps:
-      - name: レビュー取得 → SQL生成 → D1書き込み
+      # apps_to_track.json を読むためにリポジトリを取得
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ① 追跡アプリ同期：リストにあって未追加のアプリだけ tracked_apps に追加
+      - name: Sync tracked apps from list
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-          DB_ID: ${{ secrets.CF_DATABASE_ID }}
         run: |
           set -e
+          npx -y wrangler d1 execute gapspark-db --remote \
+            --command "SELECT apple_id FROM tracked_apps" --json > tracked.json
+          python3 << 'PYEOF'
+          import json, subprocess, urllib.parse, time
+          want = json.load(open("apps_to_track.json"))
+          tracked = { str(r["apple_id"]) for r in json.load(open("tracked.json"))[0]["results"] }
+          def esc(s): return (str(s) if s is not None else "").replace("'", "''")
+          def itunes(url):
+              try:
+                  out = subprocess.run(["curl","-s","-A","Mozilla/5.0",url],
+                                       capture_output=True, text=True, timeout=20).stdout
+                  res = json.loads(out).get("results", [])
+                  return res[0] if res else None
+              except Exception: return None
+          new_rows = []
+          for entry in want:
+              name = entry.get("name","")
+              aid = entry.get("apple_id")
+              if aid:
+                  info = itunes(f"https://itunes.apple.com/lookup?id={aid}&country=us")
+              else:
+                  q = urllib.parse.quote(name)
+                  info = itunes(f"https://itunes.apple.com/search?term={q}&media=software&country=us&limit=1")
+              if not info:
+                  print(f"  見つからない: {name or aid}"); continue
+              tid = str(info["trackId"])
+              if tid in tracked:
+                  print(f"  既に追跡中: {info['trackName']}"); continue
+              cat = entry.get("category") or info.get("primaryGenreName","")
+              new_rows.append(
+                  f"('{tid}', '{esc(info['trackName'])}', '{esc(cat)}', '[]', "
+                  f"'{esc(info.get('artworkUrl100',''))}', {info.get('averageUserRating') or 0}, "
+                  f"{info.get('userRatingCount') or 0})")
+              tracked.add(tid)
+              print(f"  ➕ 追加: {info['trackName']} (id={tid})")
+              time.sleep(0.3)
+          if new_rows:
+              sql = ("INSERT OR IGNORE INTO tracked_apps "
+                     "(apple_id, app_name, category, tags, icon_url, average_rating, total_ratings) VALUES\n"
+                     + ",\n".join(new_rows) + ";")
+              open("new_apps.sql","w").write(sql)
+              print(f"==> {len(new_rows)} 個の新アプリを追加します")
+          else:
+              print("==> 新規追加なし（全部すでに追跡中）")
+          PYEOF
+          if [ -f new_apps.sql ]; then
+            npx -y wrangler d1 execute gapspark-db --remote --file new_apps.sql
+            echo "==> 新アプリ追加 完了"
+          fi
 
-          # ① D1から追跡中アプリのID一覧を取得（apple_id と 内部id）
-          echo "==> 追跡アプリ一覧を取得中..."
+      # ② レビュー取得 → D1書き込み（新アプリ含む全 tracked_apps が対象）
+      - name: Fetch reviews to D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -e
           npx -y wrangler d1 execute gapspark-db --remote \
             --command "SELECT id, apple_id FROM tracked_apps" --json > apps.json
-
-          # ② 各アプリのレビューをApple RSSから取得し、50行ずつのSQLに変換
           python3 << 'PYEOF'
-          import json, subprocess, urllib.parse, time, re, os
-
+          import json, subprocess, time, re
           apps = json.load(open("apps.json"))[0]["results"]
           print(f"==> {len(apps)} アプリのレビューを取得します")
-
           def esc(s):
               if s is None: return ""
-              s = str(s).replace("'", "''")
-              return re.sub(r"\s+", " ", s).strip()
-
+              return re.sub(r"\s+", " ", str(s).replace("'", "''")).strip()
           rows = []
           for a in apps:
-              aid = a["apple_id"]
-              tid = a["id"]
+              aid, tid = a["apple_id"], a["id"]
               url = f"https://itunes.apple.com/us/rss/customerreviews/page=1/id={aid}/sortby=mostrecent/json"
               try:
-                  raw = subprocess.run(["curl","-s","-A","Mozilla/5.0",url],
-                                       capture_output=True, text=True, timeout=25).stdout
-                  entries = json.loads(raw).get("feed",{}).get("entry")
-                  if not isinstance(entries, list): entries = []
-                  entries = entries[1:]  # 先頭はアプリ情報
+                  entries = json.loads(subprocess.run(["curl","-s","-A","Mozilla/5.0",url],
+                      capture_output=True,text=True,timeout=25).stdout).get("feed",{}).get("entry")
+                  entries = entries[1:] if isinstance(entries, list) else []
               except Exception:
                   entries = []
               for r in entries:
                   try:
-                      rid = r["id"]["label"]
-                      author = r.get("author",{}).get("name",{}).get("label","")
-                      rating = int(r.get("im:rating",{}).get("label","0") or 0)
-                      title = r.get("title",{}).get("label","")
-                      body = r.get("content",{}).get("label","")
-                      ver = r.get("im:version",{}).get("label","")
-                      date = r.get("updated",{}).get("label","")
                       rows.append(
-                          f"({tid}, '{esc(rid)}', '{esc(author)}', {rating}, "
-                          f"'{esc(title)}', '{esc(body)}', '{esc(ver)}', 'us', '{esc(date)}')"
-                      )
+                          f"({tid}, '{esc(r['id']['label'])}', "
+                          f"'{esc(r.get('author',{}).get('name',{}).get('label',''))}', "
+                          f"{int(r.get('im:rating',{}).get('label','0') or 0)}, "
+                          f"'{esc(r.get('title',{}).get('label',''))}', "
+                          f"'{esc(r.get('content',{}).get('label',''))}', "
+                          f"'{esc(r.get('im:version',{}).get('label',''))}', 'us', "
+                          f"'{esc(r.get('updated',{}).get('label',''))}')")
                   except Exception:
                       pass
               time.sleep(0.5)
-
           print(f"==> 取得レビュー総数: {len(rows)}")
-
-          # 50行ずつの複数INSERTに分割（D1のstatement長制限対策）
           COLS = "(tracked_app_id, review_id, author, rating, title, body, app_version, region, review_date)"
-          BATCH = 50
           out = []
-          for i in range(0, len(rows), BATCH):
-              chunk = rows[i:i+BATCH]
+          for i in range(0, len(rows), 50):
               out.append(f"INSERT OR IGNORE INTO reviews {COLS} VALUES")
-              out.append(",\n".join(chunk) + ";")
-          with open("reviews.sql","w") as f:
-              f.write("\n".join(out) + "\n")
-          print(f"==> SQL生成完了: {(len(rows)+BATCH-1)//BATCH} 個のINSERT文")
+              out.append(",\n".join(rows[i:i+50]) + ";")
+          open("reviews.sql","w").write("\n".join(out) + "\n")
+          print(f"==> SQL生成完了: {(len(rows)+49)//50} 個のINSERT文")
           PYEOF
-
-          # ③ 生成したSQLをD1に流し込む（重複はINSERT OR IGNOREで自動スキップ）
           if [ -s reviews.sql ]; then
-            echo "==> D1に書き込み中..."
             npx -y wrangler d1 execute gapspark-db --remote --file reviews.sql
-            echo "==> 完了！"
+            echo "==> D1書き込み 完了！"
           else
-            echo "==> 取得0件。今回はスキップ。"
+            echo "==> 取得0件。スキップ。"
           fi
