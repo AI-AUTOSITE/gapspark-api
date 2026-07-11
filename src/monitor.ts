@@ -22,9 +22,9 @@ type Stats = {
   negative: number
   positive: number
   painPoints: number
+  trackedApps: number
 }
 
-// 現在の統計（health と同じ定義: analyzed = sentiment_score IS NOT NULL）
 async function getStats(db: D1Database): Promise<Stats> {
   const row = await db.prepare(`
     SELECT
@@ -32,7 +32,8 @@ async function getStats(db: D1Database): Promise<Stats> {
       (SELECT COUNT(*) FROM reviews WHERE sentiment_score IS NOT NULL) AS analyzed,
       (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'NEGATIVE') AS negative,
       (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'POSITIVE') AS positive,
-      (SELECT COUNT(*) FROM pain_points) AS painPoints
+      (SELECT COUNT(*) FROM pain_points) AS painPoints,
+      (SELECT COUNT(*) FROM tracked_apps) AS trackedApps
   `).first<Record<string, number>>()
   return {
     total: row?.total ?? 0,
@@ -40,6 +41,7 @@ async function getStats(db: D1Database): Promise<Stats> {
     negative: row?.negative ?? 0,
     positive: row?.positive ?? 0,
     painPoints: row?.painPoints ?? 0,
+    trackedApps: row?.trackedApps ?? 0,
   }
 }
 
@@ -110,16 +112,22 @@ function weeklyReportHtml(stats: Stats, prevAnalyzed: number | null, prevPP: num
   const ratio = stats.total > 0 ? Math.round((stats.analyzed / stats.total) * 100) : 0
   const dAnalyzed = prevAnalyzed != null ? stats.analyzed - prevAnalyzed : null
   const dPP = prevPP != null ? stats.painPoints - prevPP : null
-  let recommend = 'OK 順調です。何もしなくて大丈夫。自動でデータが育っています。'
-  if (ratio >= 90) {
-    recommend = '注意: 分析がほぼ完了しています。Apple RSS は最新約50件のフィードで過去分ページングは不可なので、新データ源（Hacker News）やアプリ追加で新しいペインポイントを増やす時期です。'
+
+  // 推奨文（実態に合わせて更新）：
+  // レビュー取得は GitHub Actions で自動化済み。分析が追いついているのは正常。
+  // 成長のレバーは「追跡アプリを増やす」= apps_to_track.json に名前を足すこと。
+  let recommend = 'OK 順調です。GitHub Actions が6時間ごとにレビューを取得し、分析・ペイン生成まで自動で回っています。何もしなくて大丈夫。'
+  if (dPP != null && dPP <= 0 && ratio >= 90) {
+    recommend = '注意: 分析は追いついていますが、ペインポイントが増えていません。既存アプリを掘り尽くしたサインです。GitHubリポジトリの apps_to_track.json に新しいアプリ名を足してコミットすると、自動で追加・取得・分析されます（成長のレバー）。'
   }
+
   return `
   <div style="font-family:sans-serif;max-width:640px">
     <h2>GapSpark 週次レポート</h2>
     <p>${todayUTC()} 時点の状況です。</p>
     <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
       <tr style="background:#f0f0f0"><th>項目</th><th>現在</th><th>先週比</th></tr>
+      <tr><td>追跡アプリ数</td><td>${fmt(stats.trackedApps)}</td><td>—</td></tr>
       <tr><td>総レビュー</td><td>${fmt(stats.total)}</td><td>—</td></tr>
       <tr><td>分析済み</td><td>${fmt(stats.analyzed)}（${ratio}%）</td><td>${dAnalyzed != null ? '+' + fmt(dAnalyzed) : '—'}</td></tr>
       <tr><td>ネガティブ</td><td>${fmt(stats.negative)}</td><td>—</td></tr>
