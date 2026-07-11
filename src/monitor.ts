@@ -93,18 +93,17 @@ function fmt(n: number): string {
   return n.toLocaleString('en-US')
 }
 
-// 判断表（全メール共通）
 function decisionTableHtml(): string {
   return `
   <h3>判断表（数字の見方）</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
     <tr style="background:#f0f0f0"><th>数字</th><th>状態</th><th>やること</th></tr>
-    <tr><td rowspan="2">分析の進捗</td><td>90%未満</td><td>何もしない（自動で進む）</td></tr>
-    <tr><td>90%以上</td><td>新データ源を追加（Hacker News）or アプリ追加</td></tr>
-    <tr><td rowspan="2">新規ペインポイント</td><td>まだ増えてる</td><td>何もしない</td></tr>
-    <tr><td>数日増えない</td><td>アプリ追加 or Hacker News 取得</td></tr>
-    <tr><td rowspan="2">分析が止まってないか</td><td>増えてる</td><td>OK（正常）</td></tr>
-    <tr><td>増えてない</td><td>要調査（Cron停止/エラーの可能性）</td></tr>
+    <tr><td rowspan="2">分析の進捗</td><td>90%未満</td><td>何もしない（ファストレーンが自動で消化）</td></tr>
+    <tr><td>90%以上</td><td>正常。分析が取得に追いついている状態</td></tr>
+    <tr><td rowspan="2">新規ペインポイント</td><td>まだ増えてる</td><td>何もしない（既存アプリをまだ掘れている）</td></tr>
+    <tr><td>数日増えない</td><td>掘り尽くしサイン。apps_to_track.json にアプリ名を足してコミット → 自動で追加・取得・分析</td></tr>
+    <tr><td rowspan="2">レビュー取得（GitHub Actions）</td><td>緑✅が続く</td><td>OK（正常。6時間ごとに自動取得）</td></tr>
+    <tr><td>赤❌が出た</td><td>失敗通知メールが届く。Actionsログを確認（CFトークン失効・Apple側障害などを疑う）</td></tr>
   </table>`
 }
 
