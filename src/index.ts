@@ -10,6 +10,7 @@ import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
 import { runMonitor, sendTestEmail, sendWeeklyReportNow } from './monitor'
 import { recordDailySnapshot, getDashboardData } from './dashboard'
 import { verifySubscription, applyProEntitlement, getUserSubscription, handleAppStoreNotification } from './subscription'
+import { generateIdea, generateAutoIdeas, getAutoIdeas, checkIdeaGenLimit, recordIdeaGenUsage } from './ideas'
 
 // Cloudflare Workers の環境変数型定義
 type Bindings = {
@@ -281,6 +282,17 @@ app.get('/api/dashboard', async (c) => {
   }
 })
 
+// おまかせアイデア一覧（公開・複数アプリの不満を掛け合わせた新アプリ案。新しい順）
+app.get('/api/ideas', async (c) => {
+  try {
+    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50)
+    const ideas = await getAutoIdeas(c.env.DB, limit)
+    return c.json({ ideas })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // ========================================
 // 認証エンドポイント
 // ========================================
@@ -411,6 +423,66 @@ app.get('/api/user/deep-dive-usage', async (c, next) => {
     const message = error instanceof Error ? error.message : String(error)
     console.error('deep-dive-usage error:', error)
     return c.json({ error: 'Failed to fetch usage', detail: message }, 500)
+  }
+})
+
+// 手動アイデア生成（認証必須・複数ペインを掛け合わせて新アプリ案を生成・3回/日制限）
+// body: { "pain_point_ids": [12, 45, 78] }（2〜3個）
+app.post('/api/ideas/generate', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const body = await c.req.json() as { pain_point_ids?: number[] }
+    const ids = Array.isArray(body.pain_point_ids) ? body.pain_point_ids : []
+    if (ids.length < 2 || ids.length > 3) {
+      return c.json({ error: '2〜3個のペインを選んでください' }, 400)
+    }
+
+    // 使用回数チェック（1日3回制限。Proは無制限）
+    const limit = await checkIdeaGenLimit(c.env.DB, userId)
+    if (!limit.allowed) {
+      return c.json({
+        error: 'Daily idea generation limit reached',
+        used: limit.used,
+        limit: limit.limit,
+        message: '本日の無料アイデア生成（3回）を使い切りました。明日UTC0時にリセットされます。'
+      }, 429)
+    }
+
+    // 生成（キャッシュ優先）
+    const { idea, cached } = await generateIdea(c.env.DB, c.env.CLAUDE_API_KEY, ids, 'manual')
+
+    // キャッシュヒットはカウントしない。新規生成のときだけ1回記録（Deep Diveと同じ方針）。
+    if (!cached) await recordIdeaGenUsage(c.env.DB, userId)
+    const increment = cached ? 0 : 1
+    const remaining = limit.limit < 0 ? -1 : limit.limit - limit.used - increment
+
+    return c.json({
+      idea,
+      cached,
+      usage: { used: limit.used + increment, limit: limit.limit, remaining }
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    console.error('Idea generation error:', error)
+    return c.json({ error: 'Idea generation failed', detail: message }, 500)
+  }
+})
+
+// 手動アイデア生成の残り回数（認証必須・生成ボタン付近の表示用）
+app.get('/api/user/idea-usage', async (c, next) => {
+  const mw = authMiddleware(c.env.JWT_SECRET)
+  return mw(c, next)
+}, async (c) => {
+  try {
+    const userId = c.get('userId')
+    const limit = await checkIdeaGenLimit(c.env.DB, userId)
+    const remaining = limit.limit < 0 ? -1 : Math.max(0, limit.limit - limit.used)
+    return c.json({ used: limit.used, limit: limit.limit, remaining, pro: limit.pro })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
   }
 })
 
@@ -854,6 +926,15 @@ app.get('/api/debug/backfill-idea-titles', async (c) => {
     message: 'Idea titles backfill completed',
     ...result
   })
+})
+
+// おまかせアイデアを一括事前生成（手動テスト用。?count=3 で件数指定、既定5・最大10）
+// 相性の良い組合せを自動で見つけて Claude(Sonnet)で生成しキャッシュ。将来は週次cronが叩く想定。
+app.get('/api/debug/generate-auto-ideas', async (c) => {
+  const count = Math.min(parseInt(c.req.query('count') || '5'), 10)
+  console.log(`Manual auto-idea generation triggered (count=${count})`)
+  const result = await generateAutoIdeas(c.env.DB, c.env.CLAUDE_API_KEY, count)
+  return c.json({ message: 'Auto idea generation completed', ...result })
 })
 
 // 7. Deep Dive テスト（認証なし、テストユーザーID=1使用）
