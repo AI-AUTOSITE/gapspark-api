@@ -1,5 +1,13 @@
 [
   { "name": "Flighty flight tracker" },
   { "name": "Parcel delivery tracker" },
-  { "name": "Ivory for Mastodon" }
+  { "name": "Ivory for Mastodon" },
+  { "name": "Wanderlog - Travel Planner", "apple_id": "1476732439" },
+  { "name": "Hevy - Workout Tracker Gym Log", "apple_id": "1458862350" },
+  { "name": "Planta: Plant & Garden Care", "apple_id": "1410126781" },
+  { "name": "CARROT Weather: Alerts & Radar", "apple_id": "961390574" },
+  { "name": "Libby, the library app", "apple_id": "1076402606" },
+  { "name": "Delta by etoro", "apple_id": "1288676542" },
+  { "name": "Spark Mail: AI Email Assistant", "apple_id": "997102246" },
+  { "name": "Water tracker Waterllama", "apple_id": "1454778585" }
 ]
