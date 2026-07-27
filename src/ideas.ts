@@ -185,7 +185,7 @@ Rules:
 - Be specific and concrete. Avoid buzzwords and generic startup-speak.
 - The concept must clearly connect to the actual complaints above.
 - Do not restate the app names as the solution ("build a better X"). Find the real insight.
-- Output ONLY the raw JSON object, starting with { and ending with }. No prose, no markdown.`
+- Output ONLY the raw JSON object. Do NOT wrap it in markdown code fences (no \`\`\`). Start your response with { and end with }. No prose.`
 
   const model = mode === 'auto' ? MODEL_AUTO : MODEL_MANUAL
   const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -243,13 +243,19 @@ export async function generateAutoIdeas(
 function parseIdeaResponse(text: string): IdeaResult {
   let cleaned = text.trim()
 
-  // markdownコードブロックを除去
-  cleaned = cleaned.replace(/```(?:json)?/gi, '').trim()
+  // ① markdownフェンスを全除去（```json / ``` )
+  cleaned = cleaned.replace(/```json/gi, '').replace(/```/g, '')
 
-  // 文章が混ざっていても、最初の { から最後の } までを抜き出す
+  // ② 最初の「"app_name" を含む { 」を正しく捉えるため、
+  //    先頭の余計な文字を落として、最初の { から最後の } までを抜く
   const f = cleaned.indexOf('{')
   const l = cleaned.lastIndexOf('}')
   if (f !== -1 && l > f) cleaned = cleaned.substring(f, l + 1)
+
+  // ③ さらに、先頭が「{ 空白 {」のように { が二重で始まる場合、余分な { を1つ剥がす
+  cleaned = cleaned.replace(/^\s*\{\s*\{/, '{')
+
+  cleaned = cleaned.trim()
 
   const attempts = [
     () => JSON.parse(cleaned),
@@ -260,7 +266,6 @@ function parseIdeaResponse(text: string): IdeaResult {
     try { return validateIdea(a()) } catch { /* 次を試す */ }
   }
 
-  // それでも失敗したら、生の応答をログに出す（原因調査用）
   console.error('Idea JSON parse failed. Raw text:', text.substring(0, 800))
   throw new Error('アイデアのJSONパースに失敗しました')
 }
