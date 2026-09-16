@@ -170,7 +170,8 @@
 
     document.getElementById("content").innerHTML = cards + panels;
     document.getElementById("updated").textContent =
-      "Last updated: " + new Date(d.updated).toLocaleString("en-US");
+      "Last updated: " + new Date(d.updated).toLocaleString("en-US") +
+      (d.stats_updated_at ? " · counts as of " + d.stats_updated_at + " UTC" : "");
 
     drawCharts(d);
   }
@@ -257,10 +258,41 @@
     }
   }
 
+  // ---- Auto-refresh ----------------------------------------------------
+  // 以前は5分ごとに無条件で load() していた。タブを開きっぱなしにすると
+  // 1日288回APIを叩くことになり、D1の読み取りを大量に消費していた。
+  // 元データは6時間cronでしか更新されないので、5分間隔は元々意味がない。
+  //
+  // 変更点:
+  //   1) 間隔を15分に（データ更新周期に対して十分すぎる頻度）
+  //   2) タブが非表示の間はタイマーを止める
+  //   3) タブに戻ってきたときに1回だけ最新化する
+  const REFRESH_MS = 15 * 60 * 1000;
+  let refreshTimer = null;
+
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    refreshTimer = setInterval(function () {
+      if (!document.hidden) load();
+    }, REFRESH_MS);
+  }
+
+  function stopAutoRefresh() {
+    if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      stopAutoRefresh();
+    } else {
+      load();
+      startAutoRefresh();
+    }
+  });
+
   document.getElementById("refresh").addEventListener("click", load);
   load();
-  // Auto-refresh every 5 minutes
-  setInterval(load, 5 * 60 * 1000);
+  startAutoRefresh();
 </script>
 </body>
 </html>

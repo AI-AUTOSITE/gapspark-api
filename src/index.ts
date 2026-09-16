@@ -3,12 +3,13 @@ import { cors } from 'hono/cors'
 import { fetchAndStoreReviews, deepBackfillReviews } from './cron/fetch-reviews'
 import { fetchHackerNewsMentions, runHackerNewsCron } from './cron/fetch-hackernews'
 import { analyzeSentiment } from './cron/analyze-sentiment'
-import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal, backfillRelatedTopics, backfillIdeaTitles } from './cron/generate-pain-points'
+import { generatePainPoints, deduplicateExistingPainPoints, recalculateSeverityScores, cleanupWeaklySupportedPainPoints, backfillMentionSignal, backfillRelatedTopics, backfillIdeaTitles, scanRawReviewCopies } from './cron/generate-pain-points'
 import { getDeepDive, getCachedDeepDive, getDeepDivedPainPointIds, checkDeepDiveLimit, recordDeepDiveUsage } from './deep-dive'
 import { unifiedSearch, getPopularTopics, getAppsByTopic, getPainPointsByTopic } from './search'
 import { handleAppleAuth, authMiddleware, type AuthVariables } from './auth'
 import { runMonitor, sendTestEmail, sendWeeklyReportNow } from './monitor'
 import { recordDailySnapshot, getDashboardData } from './dashboard'
+import { refreshStatsCache, readCachedStats, refreshAppStatsCache } from './stats'
 import { verifySubscription, applyProEntitlement, getUserSubscription, handleAppStoreNotification } from './subscription'
 import { generateIdea, generateAutoIdeas, getAutoIdeas, checkIdeaGenLimit, recordIdeaGenUsage } from './ideas'
 
@@ -44,22 +45,20 @@ app.get('/', (c) => {
 
 app.get('/api/health', async (c) => {
   try {
-    // 4つのCOUNTを1往復のbatchでまとめて実行（順次awaitより高速）
+    // stats_cache から1行読むだけ（Cronが6時間ごとに更新）。
+    // 以前は COUNT(*) を4本走らせており、1回あたり約82万行を読んでいた。
+    // 公開エンドポイントなので、叩かれた回数だけD1の無料枠を溶かす構造だった。
     // ※ JSONのキーは従来どおり（iOSのHealthStatsがそのままデコードできる）
-    const stats = await c.env.DB.batch([
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM tracked_apps'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews WHERE sentiment_score IS NOT NULL'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM pain_points'),
-    ])
+    const { counts, updated_at } = await readCachedStats(c.env.DB)
 
     return c.json({
       status: 'ok',
       database: 'connected',
-      tracked_apps: (stats[0].results?.[0] as any)?.count ?? 0,
-      reviews: (stats[1].results?.[0] as any)?.count ?? 0,
-      reviews_analyzed: (stats[2].results?.[0] as any)?.count ?? 0,
-      pain_points: (stats[3].results?.[0] as any)?.count ?? 0
+      tracked_apps: counts.tracked_apps,
+      reviews: counts.total,
+      reviews_analyzed: counts.analyzed,
+      pain_points: counts.pain_points,
+      stats_updated_at: updated_at
     })
   } catch (error) {
     return c.json({
@@ -782,6 +781,21 @@ app.get('/api/debug/generate-pain-points', async (c) => {
   })
 })
 
+// 生レビューコピーの検査／掃除
+//   既定は報告のみ（何も消さない）:  /api/debug/scan-raw-copies
+//   実際に削除する:                  /api/debug/scan-raw-copies?confirm=true
+// pain_points（数百行）しか読まないので、D1の負担はほぼゼロ。
+app.get('/api/debug/scan-raw-copies', async (c) => {
+  try {
+    const confirm = c.req.query('confirm') === 'true'
+    const limit = parseInt(c.req.query('limit') || '200')
+    const result = await scanRawReviewCopies(c.env.DB, { confirm, limit })
+    return c.json(result)
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
 // 監視: テストメール（Resendが動くかの確認。叩くと即送信）
 app.get('/api/debug/send-test-email', async (c) => {
   const sent = await sendTestEmail(c.env)
@@ -836,23 +850,31 @@ app.get('/api/debug/run-pipeline', async (c) => {
 // 5. DB統計情報（NEW）
 app.get('/api/debug/stats', async (c) => {
   try {
-    const stats = await c.env.DB.batch([
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM tracked_apps'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews WHERE sentiment_score IS NOT NULL'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews WHERE sentiment_label = ?').bind('NEGATIVE'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM reviews WHERE sentiment_label = ?').bind('POSITIVE'),
-      c.env.DB.prepare('SELECT COUNT(*) as count FROM pain_points'),
-    ])
+    // こちらもキャッシュ読み（認証なしの公開URLなので、重い集計を置かない）
+    const { counts, updated_at } = await readCachedStats(c.env.DB)
 
     return c.json({
-      tracked_apps: (stats[0].results?.[0] as any)?.count ?? 0,
-      total_reviews: (stats[1].results?.[0] as any)?.count ?? 0,
-      analyzed_reviews: (stats[2].results?.[0] as any)?.count ?? 0,
-      negative_reviews: (stats[3].results?.[0] as any)?.count ?? 0,
-      positive_reviews: (stats[4].results?.[0] as any)?.count ?? 0,
-      pain_points: (stats[5].results?.[0] as any)?.count ?? 0,
+      tracked_apps: counts.tracked_apps,
+      total_reviews: counts.total,
+      analyzed_reviews: counts.analyzed,
+      negative_reviews: counts.negative,
+      positive_reviews: counts.positive,
+      pain_points: counts.pain_points,
+      deep_dives: counts.deep_dives,
+      stats_updated_at: updated_at,
     })
+  } catch (error) {
+    return c.json({ error: String(error) }, 500)
+  }
+})
+
+// 統計キャッシュを今すぐ再計算（デプロイ直後に1回だけ叩く用）
+// ここだけが重い集計を走らせる手動経路。連打しないこと。
+app.get('/api/debug/refresh-stats', async (c) => {
+  try {
+    const counts = await refreshStatsCache(c.env.DB)
+    const appStats = await refreshAppStatsCache(c.env.DB)
+    return c.json({ refreshed: true, counts, app_stats: appStats })
   } catch (error) {
     return c.json({ error: String(error) }, 500)
   }
@@ -1038,28 +1060,48 @@ export default {
       })()
     )
 
-    // 運用監視（週報＋アラート）。6時間ごとに評価し、必要なときだけメールを送る。
-    // 取得/分析とは独立して実行（互いに影響しないよう別の waitUntil にする）。
+    // 統計キャッシュの更新 → 監視 → スナップショット記録。
+    //
+    // 【重要】重い集計（reviews 全件スキャン）を行うのはこの1回だけ。
+    // 以前は runMonitor と recordDailySnapshot がそれぞれ独立に
+    // reviews を4周スキャンするクエリを実行しており、1日あたり25M行近く
+    // 読んでいた（D1無料枠は5M/日）。ここで1回だけ計算して結果を使い回す。
+    //
+    // 3つは順番に依存があるため、waitUntil を分けずに直列で実行する。
     ctx.waitUntil(
       (async () => {
         try {
-          const r = await runMonitor(env)
-          console.log('Monitor:', JSON.stringify(r))
-        } catch (err) {
-          console.error('Monitor error:', err)
-        }
-      })()
-    )
+          // Step A: 全体カウントを集計してキャッシュに保存（重い処理はここだけ）
+          const counts = await refreshStatsCache(env.DB)
+          console.log('Stats cache refreshed:', JSON.stringify(counts))
 
-    // ダッシュボード用の日次スナップショット記録（推移グラフ用）。
-    // snapshot_date でUPSERTするので、6時間ごとに呼んでも1日1行（その日の最新値で上書き）。
-    ctx.waitUntil(
-      (async () => {
-        try {
-          const r = await recordDailySnapshot(env.DB)
-          console.log('Snapshot:', JSON.stringify(r))
+          // Step A2: アプリ別の統計を集計してキャッシュに保存。
+          // 3時間cronのペインポイント生成がこれを読む（自分では集計しない）。
+          try {
+            const appStats = await refreshAppStatsCache(env.DB)
+            console.log('App stats cache refreshed:', JSON.stringify(appStats))
+          } catch (err) {
+            console.error('App stats cache error:', err)
+          }
+
+          // Step B: 運用監視（週報＋アラート）。計算済みの counts を渡す
+          try {
+            const r = await runMonitor(env, counts)
+            console.log('Monitor:', JSON.stringify(r))
+          } catch (err) {
+            console.error('Monitor error:', err)
+          }
+
+          // Step C: 日次スナップショット記録（推移グラフ用）。
+          // snapshot_date でUPSERTするので、6時間ごとに呼んでも1日1行。
+          try {
+            const r = await recordDailySnapshot(env.DB, counts)
+            console.log('Snapshot:', JSON.stringify(r))
+          } catch (err) {
+            console.error('Snapshot error:', err)
+          }
         } catch (err) {
-          console.error('Snapshot error:', err)
+          console.error('Stats/monitor/snapshot error:', err)
         }
       })()
     )

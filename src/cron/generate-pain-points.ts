@@ -1,12 +1,49 @@
 // Workers AI (Llama 3.2 1B) でペインポイントを抽出・要約
 // v3: ルールベースseverity scoring + 改善プロンプト + 厳格な重複除去
 //
+// 【2026-09-12 変更】候補アプリの選定を app_stats_cache 読み取りに置き換え。
+// 旧クエリ（tracked_apps JOIN reviews ＋ pain_points への相関サブクエリ）は
+// 1回あたり約53万行を読み、3時間cron×8回/日で約4.25M行を消費していた。
+// D1無料枠5M/日のほぼ全量。集計は6時間cronに1本化し、ここは約200行読むだけ。
+//
 // v2 → v3 改善点:
 // 1. severity_score: AI任せ → 星評価・キーワード・頻度・新しさで計算
 // 2. frequency: 「全ネガティブ数」→「この問題の該当レビュー数」
 // 3. プロンプト: 「indie devがビルドできるアプリ」視点、具体的タイトル要求
 // 4. アイデア: 「Implement a...」→「AppName — コンセプト. Target: ターゲット」
 // 5. 重複除去: 閾値 0.5→0.4、サマリー類似チェック追加、品質フィルタ追加
+
+import {
+  readCandidateApps,
+  refreshAppStatsCache,
+  isAppStatsCacheEmpty,
+  recordGenerationAttempt,
+} from '../stats'
+
+// ========================================
+// 生成モデルの設定
+// ========================================
+//
+// 【2026-09-16 変更】Llama 3.2 1B → Mistral Small 3.1 24B
+//
+// 1B は「与えられた文字列の中から、それらしいものを返す」挙動が強く、
+//   - プロンプト内の例文をそのまま返す（id 239 に指示文が保存されていた）
+//   - レビューのタイトルをそのまま返す（52件が生レビューのコピーだった）
+//   - 「トリガーを書け」という指示を守れない
+// という問題が構造的に解決できなかった。
+//
+// 24B は Workers AI に載っているので、モデル名を変えるだけで使える。
+// 単価は約13倍だが、30件を1回で渡せるため呼び出しが 6回 → 1回 に減り、
+// 1日あたり約4,000〜5,000 neurons（無料枠10,000の半分）に収まる見込み。
+//
+// 戻したいときはこの2行を元に戻すだけ:
+//   MODEL = '@cf/meta/llama-3.2-1b-instruct', REVIEWS_PER_CALL = 5
+const PAIN_POINT_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct'
+const PAIN_POINT_MODEL_LABEL = 'workers-ai-mistral-small-3.1-24b'  // pain_points.ai_model_used に記録
+const REVIEWS_PER_CALL = 30        // 1回のAI呼び出しに渡すレビュー数（1Bは5、24Bは30件まとめて）
+const REVIEW_BODY_CHARS = 300      // レビュー本文の切り詰め長（1Bは200）
+const KNOWN_TITLES_IN_PROMPT = 20  // 「既知のペイン」として渡す件数（1Bは10）
+const MAX_OUTPUT_TOKENS = 1500     // 2〜4件のペインポイント分
 
 interface AppWithReviews {
   app_id: number
@@ -86,37 +123,36 @@ export async function generatePainPoints(
   appsProcessed: number
   painPointsCreated: number
   duplicatesSkipped: number
+  rawCopiesRejected: number
   errors: number
 }> {
   let appsProcessed = 0
   let painPointsCreated = 0
   let duplicatesSkipped = 0
+  let rawCopiesRejected = 0
   let errors = 0
 
-  const apps = await db.prepare(`
-    SELECT 
-      ta.id as app_id, ta.app_name, ta.category, ta.tags,
-      COUNT(r.id) as negative_count,
-      (
-        SELECT COUNT(*) FROM pain_points pp
-        WHERE EXISTS (
-          SELECT 1 FROM json_each(pp.sample_app_ids)
-          WHERE json_each.value = ta.id
-        )
-      ) as existing_pain_points
-    FROM tracked_apps ta
-    JOIN reviews r ON r.tracked_app_id = ta.id
-    WHERE r.sentiment_label = 'NEGATIVE' AND r.sentiment_score IS NOT NULL
-    GROUP BY ta.id
-    HAVING negative_count >= 5
-    ORDER BY existing_pain_points ASC, negative_count DESC
-    LIMIT ?
-  `).bind(appsPerRun).all<AppWithReviews & { negative_count: number }>()
+  // 候補アプリは app_stats_cache から読むだけ（約200行）。
+  // 集計は6時間cronの refreshAppStatsCache() が担当する。
+  let candidates = await readCandidateApps(db, appsPerRun)
 
-  if (!apps.results || apps.results.length === 0) {
-    console.log('No apps with enough negative reviews')
-    return { appsProcessed: 0, painPointsCreated: 0, duplicatesSkipped: 0, errors: 0 }
+  // 候補0件の理由は2通りある。取り違えると事故になるので必ず区別する:
+  //   (a) キャッシュ未作成（デプロイ直後）→ 1回だけ自力で作る（自己修復）
+  //   (b) 全アプリがバックオフ待機中      → 何もしないのが正しい
+  // (b) で再集計してしまうと、3時間ごとに12万行スキャンが走って元の木阿弥になる。
+  if (candidates.length === 0 && (await isAppStatsCacheEmpty(db))) {
+    console.log('app_stats_cache is empty — refreshing once')
+    const refreshed = await refreshAppStatsCache(db)
+    console.log(`  app_stats_cache rebuilt: ${refreshed.apps} apps`)
+    candidates = await readCandidateApps(db, appsPerRun)
   }
+
+  if (candidates.length === 0) {
+    console.log('No candidate apps (all on backoff cooldown, or none with enough negative reviews)')
+    return { appsProcessed: 0, painPointsCreated: 0, duplicatesSkipped: 0, rawCopiesRejected: 0, errors: 0 }
+  }
+
+  const apps = { results: candidates }
 
   // 全既存ペインポイント（クロスアプリ重複チェック用）
   const allExisting = await db.prepare(
@@ -153,17 +189,21 @@ export async function generatePainPoints(
 
       if (!reviews.results || reviews.results.length < 5) {
         console.log(`    Skipping: not enough negative reviews`)
+        // 記録しないと毎回このアプリが候補に上がり続けるので、空振り扱いにする
+        await recordGenerationAttempt(db, app.app_id, 0)
         continue
       }
 
-      const REVIEW_BATCH_SIZE = 5
       const allPainPoints: ScoredPainPoint[] = []
 
-      for (let i = 0; i < reviews.results.length; i += REVIEW_BATCH_SIZE) {
-        const batch = reviews.results.slice(i, i + REVIEW_BATCH_SIZE)
-        
-        const reviewText = batch.map(r => 
-          `[${r.rating}★] ${r.title}: ${r.body.substring(0, 200)}`
+      // 24B は30件を一度に読めるので、通常このループは1周で終わる。
+      // 「複数のレビューに共通する問題」を見つけるには、モデルが全件を
+      // 同時に見られることが本質的に重要（5件ずつでは横断的なパターンが見えない）。
+      for (let i = 0; i < reviews.results.length; i += REVIEWS_PER_CALL) {
+        const batch = reviews.results.slice(i, i + REVIEWS_PER_CALL)
+
+        const reviewText = batch.map((r, idx) =>
+          `[${idx + 1}] (${r.rating}★) ${r.title}: ${r.body.substring(0, REVIEW_BODY_CHARS)}`
         ).join('\n')
 
         const allKnownTitles = [...existingTitles, ...allPainPoints.map(p => p.title)]
@@ -187,12 +227,29 @@ export async function generatePainPoints(
         await new Promise(r => setTimeout(r, 3000))
       }
 
-      // 重複除去（ローカル + グローバル）
-      const unique = deduplicatePainPoints(allPainPoints, globalTitles, globalSummaries)
-      duplicatesSkipped += allPainPoints.length - unique.length
+      // 生レビューコピーの除去（重複除去より前に必ず実行する）
+      // Discover に生のレビュー文が出るのはガイドライン上いちばん危険な失敗。
+      const reviewTitles = reviews.results.map(r => r.title ?? '')
+      const original = allPainPoints.filter(pp => {
+        if (isCopyOfReviewTitle(pp.title, reviewTitles)) {
+          console.log(`    Rejected (copies a review title): "${pp.title}"`)
+          return false
+        }
+        const voice = looksLikeReviewVoice(pp.title)
+        if (voice.length > 0) {
+          console.log(`    Rejected (${voice.join(',')}): "${pp.title}"`)
+          return false
+        }
+        return true
+      })
+      rawCopiesRejected += allPainPoints.length - original.length
 
-      if (allPainPoints.length > unique.length) {
-        console.log(`    Dedup: ${allPainPoints.length} → ${unique.length}`)
+      // 重複除去（ローカル + グローバル）
+      const unique = deduplicatePainPoints(original, globalTitles, globalSummaries)
+      duplicatesSkipped += original.length - unique.length
+
+      if (original.length > unique.length) {
+        console.log(`    Dedup: ${original.length} → ${unique.length}`)
       }
 
       // 品質フィルタ
@@ -218,14 +275,21 @@ export async function generatePainPoints(
         console.log(`    Signal filter: ${quality.length} → ${wellSupported.length} (dropped weakly-supported <${MIN_SUPPORTING_REVIEWS} reviews)`)
       }
 
+      let savedForApp = 0
       if (wellSupported.length > 0) {
-        const saved = await savePainPoints(db, app, wellSupported)
-        painPointsCreated += saved
+        savedForApp = await savePainPoints(db, app, wellSupported)
+        painPointsCreated += savedForApp
         wellSupported.forEach(pp => {
           globalTitles.push(pp.title)
           globalSummaries.push(pp.summary)
         })
-        console.log(`    Created ${saved} pain points for ${app.app_name}`)
+        console.log(`    Created ${savedForApp} pain points for ${app.app_name}`)
+      }
+
+      // 成果ゼロなら待ち時間を倍に、成果ありならリセット（Step C）
+      await recordGenerationAttempt(db, app.app_id, savedForApp)
+      if (savedForApp === 0) {
+        console.log(`    No new pain points — backing off ${app.app_name}`)
       }
 
       appsProcessed++
@@ -233,12 +297,14 @@ export async function generatePainPoints(
 
     } catch (e) {
       console.error(`  Error processing ${app.app_name}:`, e)
+      // 記録しないと、落ち続けるアプリを毎回選び直して先に進めなくなる
+      await recordGenerationAttempt(db, app.app_id, 0)
       errors++
     }
   }
 
-  console.log(`Complete: ${appsProcessed} apps, ${painPointsCreated} created, ${duplicatesSkipped} dupes, ${errors} errors`)
-  return { appsProcessed, painPointsCreated, duplicatesSkipped, errors }
+  console.log(`Complete: ${appsProcessed} apps, ${painPointsCreated} created, ${duplicatesSkipped} dupes, ${rawCopiesRejected} raw-copies, ${errors} errors`)
+  return { appsProcessed, painPointsCreated, duplicatesSkipped, rawCopiesRejected, errors }
 }
 
 
@@ -308,49 +374,99 @@ function applyRuleBasedScoring(
 // 改善プロンプト
 // ========================================
 
+// guided_json に渡す JSON Schema。モデルの出力をこの形に強制する。
+// トップレベルを配列ではなくオブジェクトにしているのは、多くの実装が
+// トップレベル配列を扱えないため（パーサー側で pain_points を取り出す）。
+const PAIN_POINT_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    pain_points: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          summary: { type: 'string' },
+          keywords: { type: 'array', items: { type: 'string' } },
+          related_topics: { type: 'array', items: { type: 'string' } },
+          severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
+          ai_generated_idea: { type: 'string' },
+        },
+        required: ['title', 'summary', 'keywords', 'related_topics', 'severity', 'ai_generated_idea'],
+      },
+    },
+  },
+  required: ['pain_points'],
+}
+
+// 分析の「役割」と「守るべき規則」。レビュー本文とは分離して system に置く。
+// 24B は system / user の役割分担を理解できるので、指示の遵守率が上がる。
+// 【重要】ここにも具体的な文例は書かない（モデルがコピーする余地を残さない）。
+const PAIN_POINT_SYSTEM_PROMPT = `You are a product analyst for GapSpark, a tool that helps indie developers discover app ideas by studying what frustrates users of existing apps.
+
+You will receive negative App Store reviews for ONE app. Identify RECURRING problems — issues that two or more reviewers describe — and write each one up as a pain point.
+
+For each pain point:
+- title: 5-12 words. Name the malfunction AND the condition that triggers it, in neutral technical language. This is YOUR analytical summary, never a reviewer's wording. Third person only. No emotion, no opinion, no comparison with other products, no ALL CAPS, no exclamation marks.
+- summary: 2-3 sentences. What breaks, under what conditions, and how it disrupts the user's workflow. Describe the pattern across reviewers, not one person's story.
+- keywords: 3-6 lowercase terms that actually appear in the reviews.
+- related_topics: 2-3 lowercase theme tags (single words or short phrases describing the feature area).
+- severity: critical = crash or data loss; high = core feature broken; medium = UX friction; low = missing nice-to-have.
+- ai_generated_idea: "NewAppName — one sentence describing a NEW standalone app that solves this problem, and who would pay for it." It must not be a fix for the reviewed app.
+
+Rules:
+- Report only problems mentioned by at least two reviewers. Ignore one-off complaints.
+- Skip reviews that are praise, spam, off-topic, or purely about price (unless a billing malfunction is described).
+- Never copy sentences or titles from the reviews. Rewrite everything in your own words.
+- Do not repeat anything listed under ALREADY KNOWN.
+- Return between 2 and 4 pain points. If fewer than 2 recurring problems exist, return only those that do (an empty list is acceptable).
+- Output only the JSON object. No prose before or after it.`
+
 async function extractPainPointsWithLlama(
   ai: Ai,
   app: AppWithReviews,
   reviewText: string,
   existingTitles: string[] = []
 ): Promise<ExtractedPainPoint[]> {
-  const existingInstruction = existingTitles.length > 0
-    ? `\nALREADY KNOWN (do NOT repeat):\n${existingTitles.slice(0, 10).map(t => `- ${t}`).join('\n')}\n`
+  const known = existingTitles.slice(0, KNOWN_TITLES_IN_PROMPT)
+  const knownBlock = known.length > 0
+    ? `\nALREADY KNOWN (do not repeat):\n${known.map(t => `- ${t}`).join('\n')}\n`
     : ''
 
-  const prompt = `Analyze negative reviews for "${app.app_name}" (${app.category}).
-${existingInstruction}
+  const userPrompt = `App: "${app.app_name}" (${app.category})
+${knownBlock}
 Reviews:
 ${reviewText}
 
-Extract 1-2 SPECIFIC pain points. For each, suggest a NEW standalone app idea an indie developer could build.
+Return the pain points as {"pain_points": [...]}.`
 
-JSON array only:
-[
-  {
-    "title": "Specific problem in 5-10 words (BAD: 'App crashes' / GOOD: 'App crashes when opening PDF attachments')",
-    "summary": "2-3 sentences: What exactly frustrates users? How does it affect their workflow? Be specific about the trigger and impact.",
-    "keywords": ["specific", "complaint", "terms", "from", "reviews"],
-    "related_topics": ["topic1", "topic2"],
-    "severity": "critical|high|medium|low",
-    "ai_generated_idea": "AppName — A one-sentence app concept that solves this problem as a new product. Target: who would pay for it."
+  const messages = [
+    { role: 'system', content: PAIN_POINT_SYSTEM_PROMPT },
+    { role: 'user', content: userPrompt },
+  ]
+
+  // 1回目は guided_json でスキーマを強制。万一この環境で guided_json が
+  // 弾かれた場合に備えて、失敗時はスキーマ無しでもう一度だけ試す
+  // （パーサー側が前置き・柵・途中切れに対応しているので、それでも拾える）。
+  let lastError: unknown = null
+  for (const useSchema of [true, false]) {
+    try {
+      const result = await ai.run(PAIN_POINT_MODEL as any, {
+        messages,
+        max_tokens: MAX_OUTPUT_TOKENS,
+        temperature: 0.2,
+        ...(useSchema ? { guided_json: PAIN_POINT_JSON_SCHEMA } : {}),
+      } as any) as unknown as { response?: string }
+
+      return parseLlamaResponse(result.response ?? '')
+    } catch (e) {
+      lastError = e
+      if (useSchema) {
+        console.error('    guided_json call failed, retrying without schema:', String(e).substring(0, 160))
+      }
+    }
   }
-]
-
-Rules:
-- critical=crash/data loss, high=feature broken, medium=UX frustration, low=feature wish
-- Title MUST name the specific trigger or context (not just 'crashes' but 'crashes when...')
-- ai_generated_idea must be a NEW app name + concept, not 'fix ${app.app_name}'
-- related_topics: 2-3 lowercase topical tags describing the theme, like "sync", "offline", "notifications", "search" (NOT meta-labels like "feature_category" or "use_case")
-- JSON only. No markdown, no explanation.`
-
-  const result = await ai.run('@cf/meta/llama-3.2-1b-instruct', {
-    prompt,
-    max_tokens: 600,
-    temperature: 0.3,
-  }) as { response: string }
-
-  return parseLlamaResponse(result.response)
+  throw lastError
 }
 
 
@@ -415,6 +531,83 @@ function extractWords(text: string): Set<string> {
   )
 }
 
+// ========================================
+// 生レビューコピー検出（App Store ガイドライン対策）
+// ========================================
+//
+// 【なぜ必要か】
+// Llama 3.2 1B は「与えられたテキストから、それらしい文字列を返す」挙動が強く、
+// レビュー本文を要約せずに **レビューのタイトルをそのままコピー** して返すことがある。
+// 実測で、保存済みペインポイントの約半数がレビュータイトルのコピーだった
+// （例: 全大文字のタイトル、一人称の感情表現、他社製品との比較コメント）。
+//
+// pain_points.title は Discover にそのまま表示されるため、これは
+// App Store Review Guideline 4.2.2 / 4.5.1（生コンテンツの転載）に直接触れる。
+// ガイドライン上いちばん危険な失敗なので、保存前に必ず落とす。
+//
+// コピーは互いに重複しないため、既存の重複除去ではすり抜けてしまう。
+// そのため専用の判定が要る。
+
+// レビュー特有の言い回し。分析文には現れない
+const REVIEW_VOICE_PATTERNS: RegExp[] = [
+  /\b(i|me|my|mine|we|our|us)\b/i,                       // 一人称
+  /\bthis (app|site|game|company|thing|update|version)\b/i, // 対象を指差す言い方
+  /\b(worst|terrible|horrible|awful|useless|garbage|trash|crap|slop|sucks?|scam|ripoff)\b/i,
+  /\b(hate|love|lied|stole|disappointed|refund|uninstall)\b/i,
+  /\b(never|dont|don't|do not) (use|download|buy|bother|waste)\b/i,
+  /\bwaste of (time|money)\b/i,
+  /\b\d\s*stars?\b/i,                                    // 星評価への言及
+  /\b(is|are)\s+(a\s+|the\s+)?(better|best|worse|worst)\b/i, // 他製品との比較
+]
+
+/** 分析文ではなく「レビューの声」に見えるか */
+function looksLikeReviewVoice(title: string): string[] {
+  const reasons: string[] = []
+  const words = title.trim().split(/\s+/)
+
+  // 全大文字（2語以上）。AIの分析文がこうなることはない
+  if (words.length >= 2 && /[A-Z]/.test(title) && title === title.toUpperCase()) {
+    reasons.push('all_caps')
+  }
+  if (REVIEW_VOICE_PATTERNS[0].test(title)) reasons.push('first_person')
+  if (REVIEW_VOICE_PATTERNS[1].test(title)) reasons.push('points_at_product')
+  if (REVIEW_VOICE_PATTERNS[2].test(title) || REVIEW_VOICE_PATTERNS[3].test(title)) {
+    reasons.push('emotional_language')
+  }
+  if (REVIEW_VOICE_PATTERNS[4].test(title) || REVIEW_VOICE_PATTERNS[5].test(title)) {
+    reasons.push('review_phrase')
+  }
+  if (REVIEW_VOICE_PATTERNS[6].test(title)) reasons.push('star_rating')
+  if (REVIEW_VOICE_PATTERNS[7].test(title)) reasons.push('product_comparison')
+
+  return reasons
+}
+
+/** 比較用に正規化（記号除去・小文字化・空白圧縮） */
+function normalizeForCompare(text: string): string {
+  return text.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 生成されたタイトルが、入力レビューのタイトルのコピーかどうか。
+ * 入力レビューはすでにメモリ上にあるので、DB読み取りは発生しない。
+ */
+function isCopyOfReviewTitle(generatedTitle: string, reviewTitles: string[]): boolean {
+  const gen = normalizeForCompare(generatedTitle)
+  if (!gen) return false
+  const genWords = extractWords(generatedTitle)
+
+  for (const raw of reviewTitles) {
+    const src = normalizeForCompare(raw)
+    if (!src) continue
+
+    if (gen === src) return true                                   // 完全一致
+    if (src.split(' ').length >= 3 && (gen.includes(src) || src.includes(gen))) return true
+    if (wordOverlapRatio(genWords, extractWords(raw)) >= 0.7) return true  // ほぼ同じ
+  }
+  return false
+}
+
 function wordOverlapRatio(setA: Set<string>, setB: Set<string>): number {
   if (setA.size === 0 || setB.size === 0) return 0
   let overlap = 0
@@ -422,30 +615,77 @@ function wordOverlapRatio(setA: Set<string>, setB: Set<string>): number {
   return overlap / Math.min(setA.size, setB.size)
 }
 
-function parseLlamaResponse(response: string): ExtractedPainPoint[] {
+// max_tokens で途中打ち切られたJSON配列を救出する。
+// 最後の完結したオブジェクト（`}`）までを切り出して `]` で閉じ直す。
+// これをやらないと1件も取れず、リトライでLlama呼び出しが丸ごと無駄になる。
+function salvageTruncatedJsonArray(text: string): unknown[] | null {
+  const start = text.indexOf('[')
+  if (start === -1) return null
+
+  // 対応が取れている最後の `}` を探す（文字列リテラル内の括弧は無視する）
+  let depth = 0
+  let inString = false
+  let escaped = false
+  let lastComplete = -1
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\') { escaped = true; continue }
+    if (ch === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (ch === '{') depth++
+    else if (ch === '}') {
+      depth--
+      if (depth === 0) lastComplete = i
+    }
+  }
+
+  if (lastComplete === -1) return null
   try {
-    const parsed = JSON.parse(response.trim())
+    const parsed = JSON.parse(text.slice(start, lastComplete + 1) + ']')
+    return Array.isArray(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+function parseLlamaResponse(response: string): ExtractedPainPoint[] {
+  // ```json ... ``` のマークダウン柵を外す（「JSON only」と指示しても付けてくる）
+  const cleaned = response.replace(/```(?:json)?/gi, '').trim()
+
+  try {
+    const parsed = JSON.parse(cleaned)
     if (Array.isArray(parsed)) return validatePainPoints(parsed)
+    if (Array.isArray(parsed?.pain_points)) return validatePainPoints(parsed.pain_points)  // guided_json 形式
     if (parsed.title) return validatePainPoints([parsed])
   } catch {}
 
   try {
-    const match = response.match(/\[[\s\S]*\]/)
+    const match = cleaned.match(/\[[\s\S]*\]/)
     if (match) {
       const parsed = JSON.parse(match[0])
       if (Array.isArray(parsed)) return validatePainPoints(parsed)
     }
   } catch {}
 
+  // 途中切れの救出（前置きが付いていても indexOf('[') で拾える）
+  const salvaged = salvageTruncatedJsonArray(cleaned)
+  if (salvaged && salvaged.length > 0) {
+    console.log(`    Salvaged ${salvaged.length} item(s) from truncated JSON`)
+    return validatePainPoints(salvaged as any[])
+  }
+
   try {
-    const match = response.match(/\{[\s\S]*\}/)
+    const match = cleaned.match(/\{[\s\S]*\}/)
     if (match) {
       const parsed = JSON.parse(match[0])
+      if (Array.isArray(parsed?.pain_points)) return validatePainPoints(parsed.pain_points)
       if (parsed.title) return validatePainPoints([parsed])
     }
   } catch {}
 
-  console.error('  Failed to parse Llama response:', response.substring(0, 200))
+  console.error('  Failed to parse Llama response:', cleaned.substring(0, 200))
   return []
 }
 
@@ -591,7 +831,7 @@ async function savePainPoints(
   const insertStmt = db.prepare(`
     INSERT INTO pain_points 
     (category, title, summary, severity_score, frequency, sample_app_ids, keywords, related_topics, ai_generated_idea, mention_count, sample_size, ai_model_used, last_updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'workers-ai-llama-3.2-1b', datetime('now'))
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '${PAIN_POINT_MODEL_LABEL}', datetime('now'))
   `)
 
   const appIds = [app.app_id]
@@ -1021,4 +1261,98 @@ export async function backfillIdeaTitles(
 
   console.log(`Idea titles backfill: total(App Idea)=${total} updated=${updated}`)
   return { total, updated }
+}
+
+// ========================================
+// 既存ペインポイントの生レビューコピー検査（掃除用）
+// ========================================
+//
+// 既に保存済みの pain_points から、レビュー文のコピーに見えるものを洗い出す。
+//
+// 【安全設計】既定は「報告のみ」。削除には confirm=true を明示的に渡す必要がある。
+// 判定はヒューリスティックなので取りこぼしも誤検出もある。必ず目視してから消すこと。
+//
+// reviews テーブルとの照合は【絶対にしない】。
+// reviews.title にインデックスが無いため、418 × 204,947 = 約8,500万行の
+// フルスキャンになり、D1の1日分の枠を一発で使い切る。
+// pain_points（数百行）だけを読んで、文章の特徴から判定する。
+export async function scanRawReviewCopies(
+  db: D1Database,
+  options: { confirm?: boolean; limit?: number } = {}
+): Promise<Record<string, unknown>> {
+  const { confirm = false, limit = 200 } = options
+
+  const all = await db
+    .prepare('SELECT id, title FROM pain_points ORDER BY id')
+    .all<{ id: number; title: string }>()
+
+  const rows = all.results ?? []
+  const flagged: { id: number; title: string; reasons: string[] }[] = []
+  const byReason: Record<string, number> = {}
+
+  for (const row of rows) {
+    const reasons = looksLikeReviewVoice(row.title ?? '')
+    if (reasons.length === 0) continue
+    flagged.push({ id: row.id, title: row.title, reasons })
+    for (const r of reasons) byReason[r] = (byReason[r] ?? 0) + 1
+  }
+
+  let deleted = 0
+  let deepDivesDeleted = 0
+  let savedIdeasUnlinked = 0
+
+  if (confirm && flagged.length > 0) {
+    const ids = flagged.map(f => f.id)
+
+    // pain_points には2つの参照元があるため、先に片付けないと
+    // FOREIGN KEY constraint failed で削除が丸ごと失敗する。
+    // 2つは性質が違うので、扱いを分ける:
+    //   deep_dives  … Claude APIのキャッシュ。消しても再生成できる → 削除
+    //   saved_ideas … ユーザーが保存したアイデア。消してはいけない → 紐付けのみ解除
+    //                 （idea_title / idea_description / idea_prompt は行自体に
+    //                   入っているので、pain_point_id を NULL にしても中身は残る）
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100)
+      const placeholders = chunk.map(() => '?').join(',')
+
+      // ① ユーザーのアイデアは残したまま、紐付けだけ外す
+      const unlink = await db
+        .prepare(`UPDATE saved_ideas SET pain_point_id = NULL WHERE pain_point_id IN (${placeholders})`)
+        .bind(...chunk)
+        .run()
+      savedIdeasUnlinked += unlink.meta?.changes ?? 0
+
+      // ② キャッシュは削除
+      const dd = await db
+        .prepare(`DELETE FROM deep_dives WHERE pain_point_id IN (${placeholders})`)
+        .bind(...chunk)
+        .run()
+      deepDivesDeleted += dd.meta?.changes ?? 0
+
+      // ③ 本体を削除
+      const res = await db
+        .prepare(`DELETE FROM pain_points WHERE id IN (${placeholders})`)
+        .bind(...chunk)
+        .run()
+      deleted += res.meta?.changes ?? 0
+    }
+    console.log(
+      `Deleted ${deleted} raw-review-copy pain points ` +
+      `(deep_dives removed: ${deepDivesDeleted}, saved_ideas unlinked: ${savedIdeasUnlinked})`
+    )
+  }
+
+  return {
+    total: rows.length,
+    flagged: flagged.length,
+    by_reason: byReason,
+    deleted,
+    deep_dives_deleted: deepDivesDeleted,
+    saved_ideas_unlinked: savedIdeasUnlinked,
+    dry_run: !confirm,
+    note: confirm
+      ? 'Deleted. Run refresh-stats to update caches.'
+      : 'Nothing deleted. Review the list, then re-run with confirm=true.',
+    samples: flagged.slice(0, limit),
+  }
 }

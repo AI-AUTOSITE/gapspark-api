@@ -1,6 +1,13 @@
 // 運用監視: 週報 + アラートメール（Resend経由）
 // 既存の6時間Cronから runMonitor() を呼ぶ設計（Cronは増やさない＝無料枠3本のまま）。
 // 状態は D1 の monitor_state テーブルに保存（重複通知の防止・前回比の計算に使う）。
+//
+// 【2026-09-12 変更】
+// getStats() が reviews を4周フルスキャンしていたため（1回あたり約82万行）、
+// D1 の rows_read 無料枠を毎日超過していた。集計は stats.ts に移し、
+// ここではキャッシュを1行読むだけにした。読み取りコストは行数に依存しない。
+
+import { readCachedStats, type Counts } from './stats'
 
 type MonitorEnv = {
   DB: D1Database
@@ -25,23 +32,17 @@ type Stats = {
   trackedApps: number
 }
 
-async function getStats(db: D1Database): Promise<Stats> {
-  const row = await db.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM reviews) AS total,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_score IS NOT NULL) AS analyzed,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'NEGATIVE') AS negative,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'POSITIVE') AS positive,
-      (SELECT COUNT(*) FROM pain_points) AS painPoints,
-      (SELECT COUNT(*) FROM tracked_apps) AS trackedApps
-  `).first<Record<string, number>>()
+// stats_cache から1行読むだけ（重い集計はしない）。
+// Cron から counts を渡された場合はその値を使う（DBアクセスを1回節約）。
+async function getStats(db: D1Database, provided?: Counts): Promise<Stats> {
+  const c = provided ?? (await readCachedStats(db)).counts
   return {
-    total: row?.total ?? 0,
-    analyzed: row?.analyzed ?? 0,
-    negative: row?.negative ?? 0,
-    positive: row?.positive ?? 0,
-    painPoints: row?.painPoints ?? 0,
-    trackedApps: row?.trackedApps ?? 0,
+    total: c.total,
+    analyzed: c.analyzed,
+    negative: c.negative,
+    positive: c.positive,
+    painPoints: c.pain_points,
+    trackedApps: c.tracked_apps,
   }
 }
 
@@ -160,10 +161,22 @@ function alertHtml(title: string, body: string, stats: Stats): string {
 // ===== メインの監視ロジック（6時間Cronから呼ぶ） =====
 // 自分で時間ゲート（日曜のみ週報）と重複防止（cooldown）を行うので、
 // 6時間ごとに毎回呼んでも、メールは必要なときだけ送られる。
-export async function runMonitor(env: MonitorEnv): Promise<Record<string, unknown>> {
+//
+// counts: Cron が refreshStatsCache() で計算した値を渡す（省略時はキャッシュを読む）
+export async function runMonitor(env: MonitorEnv, counts?: Counts): Promise<Record<string, unknown>> {
   const db = env.DB
   const today = todayUTC()
-  const stats = await getStats(db)
+  const stats = await getStats(db, counts)
+
+  // キャッシュがまだ無い（デプロイ直後など）ときは何もしない。
+  // ゼロのまま進めると「分析が止まっている」の誤アラートが飛ぶため。
+  if (stats.total === 0) {
+    return {
+      today,
+      skipped: 'stats cache is empty — /api/debug/refresh-stats を1回叩くか、次のCronを待ってください',
+    }
+  }
+
   const ratio = stats.total > 0 ? stats.analyzed / stats.total : 0
   const actions: string[] = []
 
@@ -252,6 +265,7 @@ export async function sendTestEmail(env: MonitorEnv): Promise<boolean> {
 }
 
 // 週報を今すぐ送る（中身の確認用。状態は更新しない）
+// キャッシュを読むだけなので、何回叩いてもD1の読み取りコストは増えない。
 export async function sendWeeklyReportNow(env: MonitorEnv): Promise<boolean> {
   const stats = await getStats(env.DB)
   const prevRepAnalyzed = await getState(env.DB, 'report_analyzed')

@@ -3,49 +3,29 @@
 // - getDashboardData: ダッシュボードHTMLが取得する集計JSONを組み立てる
 //
 // monitor.ts と同じ「6時間Cronに相乗り（Cronは増やさない）」の方針。
+//
+// 【2026-09-12 変更】
+// getCounts() が reviews を4周フルスキャンしていた（1回あたり約82万行）。
+// ダッシュボードHTMLは5分ごとに自動更新するため、タブを開きっぱなしにすると
+// 1日2億行超を読む恐れがあった。集計は stats.ts に移し、ここは1行読むだけにした。
 
-type Counts = {
-  total: number
-  analyzed: number
-  negative: number
-  positive: number
-  pain_points: number
-  apps: number
-  deep_dives: number
-}
-
-// reviews / pain_points / tracked_apps / deep_dives の現在のカウントを1往復で取得
-// （health・monitor と同じ定義: analyzed = sentiment_score IS NOT NULL）
-async function getCounts(db: D1Database): Promise<Counts> {
-  const row = await db.prepare(`
-    SELECT
-      (SELECT COUNT(*) FROM reviews) AS total,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_score IS NOT NULL) AS analyzed,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'NEGATIVE') AS negative,
-      (SELECT COUNT(*) FROM reviews WHERE sentiment_label = 'POSITIVE') AS positive,
-      (SELECT COUNT(*) FROM pain_points) AS pain_points,
-      (SELECT COUNT(*) FROM tracked_apps) AS apps,
-      (SELECT COUNT(*) FROM deep_dives) AS deep_dives
-  `).first<Record<string, number>>()
-  return {
-    total: row?.total ?? 0,
-    analyzed: row?.analyzed ?? 0,
-    negative: row?.negative ?? 0,
-    positive: row?.positive ?? 0,
-    pain_points: row?.pain_points ?? 0,
-    apps: row?.apps ?? 0,
-    deep_dives: row?.deep_dives ?? 0,
-  }
-}
+import { readCachedStats, type Counts } from './stats'
 
 /**
  * 今日のスナップショットを記録（日付でUPSERT。6時間ごとに呼んでも1日1行）
  */
+// counts: Cron が refreshStatsCache() で計算した値を渡す（省略時はキャッシュを読む）
 export async function recordDailySnapshot(
-  db: D1Database
-): Promise<{ date: string; total: number; analyzed: number; pain_points: number }> {
+  db: D1Database,
+  counts?: Counts
+): Promise<Record<string, unknown>> {
   const today = new Date().toISOString().slice(0, 10) // YYYY-MM-DD (UTC)
-  const c = await getCounts(db)
+  const c = counts ?? (await readCachedStats(db)).counts
+
+  // キャッシュがまだ無いときはゼロで上書きしない（推移グラフが谷になるのを防ぐ）
+  if (c.total === 0) {
+    return { date: today, skipped: 'stats cache is empty' }
+  }
 
   await db.prepare(`
     INSERT INTO daily_snapshots
@@ -63,7 +43,7 @@ export async function recordDailySnapshot(
   `).bind(
     today,
     new Date().toISOString(),
-    c.total, c.analyzed, c.negative, c.positive, c.pain_points, c.apps
+    c.total, c.analyzed, c.negative, c.positive, c.pain_points, c.tracked_apps
   ).run()
 
   return { date: today, total: c.total, analyzed: c.analyzed, pain_points: c.pain_points }
@@ -77,7 +57,8 @@ export async function recordDailySnapshot(
  * - recent_pain_points: 最近追加されたペインポイント（一覧用）
  */
 export async function getDashboardData(db: D1Database): Promise<Record<string, unknown>> {
-  const c = await getCounts(db)
+  // キャッシュを1行読むだけ。何回呼ばれてもコストは一定（以前は毎回82万行スキャン）
+  const { counts: c, updated_at: statsUpdatedAt } = await readCachedStats(db)
 
   const trend = await db.prepare(`
     SELECT snapshot_date, total_reviews, analyzed_count,
@@ -103,6 +84,8 @@ export async function getDashboardData(db: D1Database): Promise<Record<string, u
 
   return {
     updated: Date.now(),
+    // サマリー数値がいつ時点のものか（Cronが最後に集計した時刻・UTC）
+    stats_updated_at: statsUpdatedAt,
     summary: {
       total_reviews: c.total,
       analyzed: c.analyzed,
@@ -110,7 +93,7 @@ export async function getDashboardData(db: D1Database): Promise<Record<string, u
       negative: c.negative,
       positive: c.positive,
       pain_points: c.pain_points,
-      tracked_apps: c.apps,
+      tracked_apps: c.tracked_apps,
       deep_dives: c.deep_dives,
     },
     trend: trend.results ?? [],
