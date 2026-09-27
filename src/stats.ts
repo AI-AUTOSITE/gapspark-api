@@ -151,6 +151,7 @@ export type CandidateApp = {
   window_offset: number     // 次に読み始めるレビューの位置
   empty_streak: number      // 連続で「1周まるごと空振り」した回数
   cycle_created: number     // 現在の周回で生まれたペインポイント数
+  error_streak: number      // 同じ窓で連続してエラーになった回数
 }
 
 /**
@@ -229,11 +230,12 @@ export function cooldownHours(emptyStreak: number): number {
   return BASE_COOLDOWN_HOURS * Math.pow(2, steps)
 }
 
-type CandidateRow = Omit<CandidateApp, 'window_offset' | 'empty_streak' | 'cycle_created'> & {
+type CandidateRow = Omit<CandidateApp, 'window_offset' | 'empty_streak' | 'cycle_created' | 'error_streak'> & {
   last_attempted_at: string | null
   window_offset: number | null
   empty_streak: number | null
   cycle_created: number | null
+  error_streak: number | null
 }
 
 /**
@@ -275,7 +277,8 @@ export async function readCandidateApps(
       g.last_attempted_at AS last_attempted_at,
       g.window_offset     AS window_offset,
       g.empty_streak      AS empty_streak,
-      g.cycle_created     AS cycle_created
+      g.cycle_created     AS cycle_created,
+      g.error_streak      AS error_streak
     FROM app_stats_cache s
     JOIN tracked_apps ta ON ta.id = s.app_id
     LEFT JOIN app_generation_state g ON g.app_id = s.app_id
@@ -316,6 +319,7 @@ export async function readCandidateApps(
     window_offset: num(row.window_offset),
     empty_streak: num(row.empty_streak),
     cycle_created: num(row.cycle_created),
+    error_streak: num(row.error_streak),
   }))
 }
 
@@ -338,6 +342,7 @@ export async function recordGenerationAttempt(
   reviewsInWindow: number,
   windowSize: number
 ): Promise<{ nextOffset: number; wrapped: boolean; emptyStreak: number }> {
+  // ここに来た = 実際に読めた。エラー連続カウントはリセット
   const nextRaw = app.window_offset + windowSize
   const wrapped = nextRaw >= app.negative_count || reviewsInWindow < windowSize
   const nextOffset = wrapped ? 0 : nextRaw
@@ -354,15 +359,16 @@ export async function recordGenerationAttempt(
   try {
     await db.prepare(`
       INSERT INTO app_generation_state
-        (app_id, last_attempted_at, last_created_at, empty_streak, window_offset, cycle_created, updated_at)
+        (app_id, last_attempted_at, last_created_at, empty_streak, window_offset, cycle_created, error_streak, updated_at)
       VALUES
-        (?, datetime('now'), CASE WHEN ? > 0 THEN datetime('now') ELSE NULL END, ?, ?, ?, datetime('now'))
+        (?, datetime('now'), CASE WHEN ? > 0 THEN datetime('now') ELSE NULL END, ?, ?, ?, 0, datetime('now'))
       ON CONFLICT(app_id) DO UPDATE SET
         last_attempted_at = datetime('now'),
         last_created_at   = CASE WHEN ? > 0 THEN datetime('now') ELSE app_generation_state.last_created_at END,
         empty_streak      = ?,
         window_offset     = ?,
         cycle_created     = ?,
+        error_streak      = 0,
         updated_at        = datetime('now')
     `).bind(
       app.app_id, created, streak, nextOffset, nextCycleCreated,
@@ -374,4 +380,55 @@ export async function recordGenerationAttempt(
   }
 
   return { nextOffset, wrapped, emptyStreak: streak }
+}
+
+/**
+ * 生成が例外で落ちたときの記録。「空だった」とは区別する。
+ *
+ *   1回目のエラー: 窓は動かさない。待機だけ記録し、次回は同じ窓を読み直す
+ *   2回目連続:     その窓は飛ばす（同じ窓で永久に落ち続けるのを防ぐ）。
+ *                  飛ばした窓は empty_streak / cycle_created に数えない
+ *
+ * 一時的な Workers AI の不調で50件が1周ぶん飛ばされるのを防ぐための区別。
+ */
+const MAX_ERRORS_PER_WINDOW = 2
+
+export async function recordGenerationError(
+  db: D1Database,
+  app: Pick<CandidateApp, 'app_id' | 'negative_count' | 'window_offset' | 'error_streak' | 'cycle_created'>,
+  windowSize: number
+): Promise<{ held: boolean; nextOffset: number }> {
+  const errors = app.error_streak + 1
+  const skip = errors >= MAX_ERRORS_PER_WINDOW
+
+  let nextOffset = app.window_offset
+  let nextCycleCreated = app.cycle_created
+  if (skip) {
+    const nextRaw = app.window_offset + windowSize
+    const wrapped = nextRaw >= app.negative_count
+    nextOffset = wrapped ? 0 : nextRaw
+    if (wrapped) nextCycleCreated = 0
+  }
+
+  try {
+    await db.prepare(`
+      INSERT INTO app_generation_state
+        (app_id, last_attempted_at, empty_streak, window_offset, cycle_created, error_streak, updated_at)
+      VALUES
+        (?, datetime('now'), 0, ?, ?, ?, datetime('now'))
+      ON CONFLICT(app_id) DO UPDATE SET
+        last_attempted_at = datetime('now'),
+        window_offset     = ?,
+        cycle_created     = ?,
+        error_streak      = ?,
+        updated_at        = datetime('now')
+    `).bind(
+      app.app_id, nextOffset, nextCycleCreated, skip ? 0 : errors,
+      nextOffset, nextCycleCreated, skip ? 0 : errors
+    ).run()
+  } catch (e) {
+    console.error(`recordGenerationError failed for app ${app.app_id}:`, e)
+  }
+
+  return { held: !skip, nextOffset }
 }

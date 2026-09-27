@@ -18,6 +18,7 @@ import {
   refreshAppStatsCache,
   isAppStatsCacheEmpty,
   recordGenerationAttempt,
+  recordGenerationError,
 } from '../stats'
 
 // ========================================
@@ -310,9 +311,12 @@ export async function generatePainPoints(
 
     } catch (e) {
       console.error(`  Error processing ${app.app_name}:`, e)
-      // 記録しないと、落ち続けるアプリを毎回選び直して先に進めなくなる。
-      // 窓も進める（同じ窓で落ち続けるのを避ける）
-      await recordGenerationAttempt(db, app, 0, REVIEWS_PER_CALL, REVIEWS_PER_CALL)
+      // エラーは「空だった」とは別物。窓は動かさず、次回同じ窓を読み直す。
+      // 2回連続で落ちたときだけ、その窓を飛ばす（永久ループ防止）。
+      const r = await recordGenerationError(db, app, REVIEWS_PER_CALL)
+      console.log(r.held
+        ? `    Window held — will retry the same reviews next time`
+        : `    Two consecutive errors on this window — skipping to ${r.nextOffset}`)
       errors++
     }
   }
