@@ -40,7 +40,12 @@ import {
 //   MODEL = '@cf/meta/llama-3.2-1b-instruct', REVIEWS_PER_CALL = 5
 const PAIN_POINT_MODEL = '@cf/mistralai/mistral-small-3.1-24b-instruct'
 const PAIN_POINT_MODEL_LABEL = 'workers-ai-mistral-small-3.1-24b'  // pain_points.ai_model_used に記録
-const REVIEWS_PER_CALL = 30        // 1回のAI呼び出しに渡すレビュー数（1Bは5、24Bは30件まとめて）
+// 【2026-09-20 第1段】30 → 50
+// レビュー取得は sentiment_score ASC（最もネガティブな順）で固定されており、
+// 時間が経ってもほぼ同じ集合を見ていた。範囲を広げると「3人目・4人目が
+// 言っている問題」が拾える。neuron は入力トークン分だけ増え、1日約5〜6K
+// （無料枠10Kの半分強）に収まる見込み。
+const REVIEWS_PER_CALL = 50        // 1回のAI呼び出しに渡すレビュー数（1Bは5、24Bは30→50）
 const REVIEW_BODY_CHARS = 300      // レビュー本文の切り詰め長（1Bは200）
 const KNOWN_TITLES_IN_PROMPT = 20  // 「既知のペイン」として渡す件数（1Bは10）
 const MAX_OUTPUT_TOKENS = 1500     // 2〜4件のペインポイント分
@@ -165,7 +170,8 @@ export async function generatePainPoints(
 
   for (const app of apps.results) {
     try {
-      console.log(`  Processing: ${app.app_name} (${app.negative_count} negative reviews)`)
+      const windowEnd = Math.min(app.window_offset + REVIEWS_PER_CALL, app.negative_count)
+      console.log(`  Processing: ${app.app_name} — reviews ${app.window_offset + 1}–${windowEnd} of ${app.negative_count}`)
 
       // このアプリの既存ペインポイント
       const existing = await db.prepare(`
@@ -184,13 +190,14 @@ export async function generatePainPoints(
           AND sentiment_label = 'NEGATIVE'
           AND sentiment_score IS NOT NULL
         ORDER BY sentiment_score ASC
-        LIMIT 30
-      `).bind(app.app_id).all<NegativeReview>()
+        LIMIT ? OFFSET ?
+      `).bind(app.app_id, REVIEWS_PER_CALL, app.window_offset).all<NegativeReview>()
 
       if (!reviews.results || reviews.results.length < 5) {
-        console.log(`    Skipping: not enough negative reviews`)
-        // 記録しないと毎回このアプリが候補に上がり続けるので、空振り扱いにする
-        await recordGenerationAttempt(db, app.app_id, 0)
+        // この窓に5件未満 = レビュー一覧の末尾。次回は先頭（offset 0）に戻る
+        const got = reviews.results?.length ?? 0
+        console.log(`    Only ${got} reviews in this window — wrapping to the start`)
+        await recordGenerationAttempt(db, app, 0, got, REVIEWS_PER_CALL)
         continue
       }
 
@@ -286,10 +293,16 @@ export async function generatePainPoints(
         console.log(`    Created ${savedForApp} pain points for ${app.app_name}`)
       }
 
-      // 成果ゼロなら待ち時間を倍に、成果ありならリセット（Step C）
-      await recordGenerationAttempt(db, app.app_id, savedForApp)
+      // 窓を進めて記録する（Step 2: 回転）。
+      // 窓1つが空でも待機は伸ばさない。1周して何も出なかったときだけ伸びる。
+      const nav = await recordGenerationAttempt(db, app, savedForApp, reviews.results.length, REVIEWS_PER_CALL)
       if (savedForApp === 0) {
-        console.log(`    No new pain points — backing off ${app.app_name}`)
+        console.log(`    No new pain points in this window`)
+      }
+      if (nav.wrapped) {
+        console.log(`    Completed a full pass — next from the top, empty_streak=${nav.emptyStreak}`)
+      } else {
+        console.log(`    Next window starts at ${nav.nextOffset}`)
       }
 
       appsProcessed++
@@ -297,8 +310,9 @@ export async function generatePainPoints(
 
     } catch (e) {
       console.error(`  Error processing ${app.app_name}:`, e)
-      // 記録しないと、落ち続けるアプリを毎回選び直して先に進めなくなる
-      await recordGenerationAttempt(db, app.app_id, 0)
+      // 記録しないと、落ち続けるアプリを毎回選び直して先に進めなくなる。
+      // 窓も進める（同じ窓で落ち続けるのを避ける）
+      await recordGenerationAttempt(db, app, 0, REVIEWS_PER_CALL, REVIEWS_PER_CALL)
       errors++
     }
   }

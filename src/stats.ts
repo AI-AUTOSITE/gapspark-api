@@ -147,6 +147,10 @@ export type CandidateApp = {
   tags: string
   negative_count: number
   existing_pain_points: number
+  // ---- 回転・バックオフの状態（Step 2）----
+  window_offset: number     // 次に読み始めるレビューの位置
+  empty_streak: number      // 連続で「1周まるごと空振り」した回数
+  cycle_created: number     // 現在の周回で生まれたペインポイント数
 }
 
 /**
@@ -225,9 +229,11 @@ export function cooldownHours(emptyStreak: number): number {
   return BASE_COOLDOWN_HOURS * Math.pow(2, steps)
 }
 
-type CandidateRow = CandidateApp & {
+type CandidateRow = Omit<CandidateApp, 'window_offset' | 'empty_streak' | 'cycle_created'> & {
   last_attempted_at: string | null
+  window_offset: number | null
   empty_streak: number | null
+  cycle_created: number | null
 }
 
 /**
@@ -267,7 +273,9 @@ export async function readCandidateApps(
       s.negative_count   AS negative_count,
       s.pain_point_count AS existing_pain_points,
       g.last_attempted_at AS last_attempted_at,
-      g.empty_streak      AS empty_streak
+      g.window_offset     AS window_offset,
+      g.empty_streak      AS empty_streak,
+      g.cycle_created     AS cycle_created
     FROM app_stats_cache s
     JOIN tracked_apps ta ON ta.id = s.app_id
     LEFT JOIN app_generation_state g ON g.app_id = s.app_id
@@ -305,44 +313,65 @@ export async function readCandidateApps(
     tags: row.tags,
     negative_count: row.negative_count,
     existing_pain_points: row.existing_pain_points,
+    window_offset: num(row.window_offset),
+    empty_streak: num(row.empty_streak),
+    cycle_created: num(row.cycle_created),
   }))
 }
 
 /**
- * 1アプリぶんの生成結果を記録する。
- *   created > 0  … 空振り回数を0にリセット（次回もすぐ候補に戻る）
- *   created = 0  … 空振り回数を+1（次回までの待ち時間が倍になる）
+ * 1アプリぶんの生成結果を記録し、次回の読み位置を決める（Step 2: 回転）。
+ *
+ *   窓を1つ進める:        window_offset += windowSize
+ *   末尾に達したら1周:    window_offset = 0（reviewsInWindow < windowSize でも末尾とみなす）
+ *   成果が出た:           empty_streak = 0（即リセット）
+ *   1周まるごと空振り:    empty_streak += 1（窓1つの空振りでは伸ばさない）
+ *
+ * 「窓1つが空でも次の窓は当たりかもしれない」ので、1周するまでは
+ * 基本の6時間サイクルで淡々と進める。待機が伸びるのは1周して何も
+ * 出なかったときだけ。
  */
 export async function recordGenerationAttempt(
   db: D1Database,
-  appId: number,
-  created: number
-): Promise<void> {
+  app: Pick<CandidateApp, 'app_id' | 'negative_count' | 'window_offset' | 'empty_streak' | 'cycle_created'>,
+  created: number,
+  reviewsInWindow: number,
+  windowSize: number
+): Promise<{ nextOffset: number; wrapped: boolean; emptyStreak: number }> {
+  const nextRaw = app.window_offset + windowSize
+  const wrapped = nextRaw >= app.negative_count || reviewsInWindow < windowSize
+  const nextOffset = wrapped ? 0 : nextRaw
+  const cycleCreated = app.cycle_created + created
+
+  let streak = app.empty_streak
+  if (created > 0) {
+    streak = 0
+  } else if (wrapped && cycleCreated === 0) {
+    streak += 1
+  }
+  const nextCycleCreated = wrapped ? 0 : cycleCreated
+
   try {
-    if (created > 0) {
-      await db.prepare(`
-        INSERT INTO app_generation_state
-          (app_id, last_attempted_at, last_created_at, empty_streak, updated_at)
-        VALUES (?, datetime('now'), datetime('now'), 0, datetime('now'))
-        ON CONFLICT(app_id) DO UPDATE SET
-          last_attempted_at = datetime('now'),
-          last_created_at   = datetime('now'),
-          empty_streak      = 0,
-          updated_at        = datetime('now')
-      `).bind(appId).run()
-    } else {
-      await db.prepare(`
-        INSERT INTO app_generation_state
-          (app_id, last_attempted_at, last_created_at, empty_streak, updated_at)
-        VALUES (?, datetime('now'), NULL, 1, datetime('now'))
-        ON CONFLICT(app_id) DO UPDATE SET
-          last_attempted_at = datetime('now'),
-          empty_streak      = app_generation_state.empty_streak + 1,
-          updated_at        = datetime('now')
-      `).bind(appId).run()
-    }
+    await db.prepare(`
+      INSERT INTO app_generation_state
+        (app_id, last_attempted_at, last_created_at, empty_streak, window_offset, cycle_created, updated_at)
+      VALUES
+        (?, datetime('now'), CASE WHEN ? > 0 THEN datetime('now') ELSE NULL END, ?, ?, ?, datetime('now'))
+      ON CONFLICT(app_id) DO UPDATE SET
+        last_attempted_at = datetime('now'),
+        last_created_at   = CASE WHEN ? > 0 THEN datetime('now') ELSE app_generation_state.last_created_at END,
+        empty_streak      = ?,
+        window_offset     = ?,
+        cycle_created     = ?,
+        updated_at        = datetime('now')
+    `).bind(
+      app.app_id, created, streak, nextOffset, nextCycleCreated,
+      created, streak, nextOffset, nextCycleCreated
+    ).run()
   } catch (e) {
     // 記録に失敗しても生成そのものは成功しているので、握りつぶして続行する
-    console.error(`recordGenerationAttempt failed for app ${appId}:`, e)
+    console.error(`recordGenerationAttempt failed for app ${app.app_id}:`, e)
   }
+
+  return { nextOffset, wrapped, emptyStreak: streak }
 }
