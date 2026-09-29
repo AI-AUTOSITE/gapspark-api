@@ -57,8 +57,14 @@ type FetchResult =
   | { ok: true; reviews: RawReview[] }
   | { ok: false; status: number | null; message: string }
 
-// レート制限とみなす HTTP ステータス。受けたら、その回の残りのアプリは叩かない
-const RATE_LIMIT_STATUSES = new Set([403, 429])
+// レート制限の判定。
+//   429 は「多すぎる」の明示なので1回で確定。
+//   403 は「レート制限」と「そのアプリが個別に禁止（ストアから消えた等）」の
+//   どちらでも返るため、1回では判断できない。連続で来たときだけ制限とみなす。
+//   単発の403で全体を止めると、死んだアプリが先頭に来るたびに取得が丸ごと無駄になる。
+const HARD_RATE_LIMIT_STATUSES = new Set([429])
+const SOFT_RATE_LIMIT_STATUSES = new Set([403])
+const CONSECUTIVE_FAILURES_TO_STOP = 3
 
 async function fetchAppReviews(appleId: string, page: number = 1): Promise<FetchResult> {
   const url = `https://itunes.apple.com/us/rss/customerreviews/page=${page}/id=${appleId}/sortBy=mostRecent/json`
@@ -110,6 +116,7 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
   let newReviews = 0
   let errors = 0
   let rateLimited = false
+  let consecutiveFailures = 0
 
   // トラッキング対象アプリを取得
   const apps = await db.prepare(
@@ -134,12 +141,17 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
         // 失敗。「空だった」とは別物として記録する
         await markFetchFailed(db, app.id, result.message)
         errors++
+        consecutiveFailures++
         console.log(`    Fetch failed (${result.message}) — recorded`)
 
-        // レート制限なら、残りのアプリを叩いても悪化するだけ。この回は止める。
-        // 残りは last_fetched_at が古いままなので、次回の先頭に来る
-        if (result.status != null && RATE_LIMIT_STATUSES.has(result.status)) {
-          console.warn(`    Rate limited by Apple (HTTP ${result.status}) — stopping this run`)
+        const status = result.status
+        const hard = status != null && HARD_RATE_LIMIT_STATUSES.has(status)
+        const soft = status != null && SOFT_RATE_LIMIT_STATUSES.has(status)
+
+        // 429 は1回で確定。403 は連続したときだけレート制限とみなす。
+        // 止めた場合、残りは last_fetched_at が古いままなので次回の先頭に来る。
+        if (hard || (soft && consecutiveFailures >= CONSECUTIVE_FAILURES_TO_STOP)) {
+          console.warn(`    Rate limited by Apple (HTTP ${status}, ${consecutiveFailures} in a row) — stopping this run`)
           rateLimited = true
           break
         }
@@ -147,6 +159,8 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
         continue
       }
 
+      // 成功したので連続失敗はリセット
+      consecutiveFailures = 0
       const reviews = result.reviews
       console.log(`    Found ${reviews.length} reviews`)
 

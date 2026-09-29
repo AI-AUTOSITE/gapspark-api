@@ -1065,17 +1065,22 @@ export default {
       return
     }
 
-    // 【6時間ごと】レビュー取得 + 感情分析
+    // 【6時間ごと】感情分析（少量）
+    //
+    // 【2026-09-29 変更】レビュー取得ステップを撤去。
+    // GitHub Actions（.github/workflows/fetch-reviews.yml）が同じ '0 */6 * * *' で
+    // 全101アプリを取得して D1 に書いているため、ここでの20アプリ取得は完全に重複していた。
+    // しかも Cloudflare の共有IPから叩くため Apple に 403 を返されやすく、
+    // 実測でも Actions 側は成功・Worker 側は 403 という結果だった。
+    // 取得は Actions に一本化し、Worker は分析・生成・監視に専念する。
+    // fetchAndStoreReviews 自体は /api/debug/fetch-reviews（手動テスト）用に残す。
+    //
     // （ペインポイント生成は上の専用Cronが担当するのでここでは行わない）
-    console.log('Cron (fetch + sentiment) started:', new Date().toISOString())
+    console.log('Cron (sentiment) started:', new Date().toISOString())
     ctx.waitUntil(
       (async () => {
         try {
-          // Step 1: レビュー取得（20アプリ分）
-          const fetchResult = await fetchAndStoreReviews(env.DB)
-          console.log('Cron Step 1 (fetch):', JSON.stringify(fetchResult))
-
-          // Step 2: 感情分析（安全な少量。バルク消化は15分ごとのファストレーンが担当）
+          // 感情分析（安全な少量。バルク消化は15分ごとのファストレーンが担当）
           const sentimentResult = await analyzeSentiment(env.DB, env.AI, 40)
           console.log('Cron Step 2 (sentiment):', JSON.stringify(sentimentResult))
 
