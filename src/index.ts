@@ -25,12 +25,51 @@ type Bindings = {
   APPSTORE_ISSUER_ID: string   // App Store Connect API の Issuer ID
   APPSTORE_KEY_ID: string      // 生成したAPIキーの Key ID
   APPSTORE_PRIVATE_KEY: string // .p8 の中身（PEM全体）
+  DEBUG_TOKEN?: string         // /api/debug/* の合言葉（wrangler secret put DEBUG_TOKEN）
 }
 
 const app = new Hono<{ Bindings: Bindings; Variables: AuthVariables }>()
 
 // CORS設定（iOSアプリからのアクセス許可）
 app.use('/*', cors())
+
+// ========================================
+// /api/debug/* の認証（2026-09-29 追加）
+// ========================================
+// debug 系21本はどれも認証なしで公開されていた。データ削除・Claude API・
+// Workers AI・メール送信を、URLを知っていれば誰でも叩けた（GitHubがpublic
+// なのでURLは見える）。iOSアプリは debug を呼ばないので、閉じても影響はない。
+//
+// 使い方:
+//   npx wrangler secret put DEBUG_TOKEN     ← 長いランダム文字列を1回登録
+//   curl -H "Authorization: Bearer <token>" https://.../api/debug/stats
+//
+// 設計:
+//   - シークレット未設定なら 503 で全拒否（fail closed）。設定忘れで開いたままにしない
+//   - 比較は timingSafeEqual（1文字ずつ比較すると応答時間から推測できるため）
+//   - cron（scheduled ハンドラ）はHTTPを通らないので影響なし
+app.use('/api/debug/*', async (c, next) => {
+  const expected = c.env.DEBUG_TOKEN
+  if (!expected) {
+    return c.json(
+      { error: 'DEBUG_TOKEN is not configured. Run: npx wrangler secret put DEBUG_TOKEN' },
+      503
+    )
+  }
+
+  const header = c.req.header('Authorization') ?? ''
+  const given = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+
+  const enc = new TextEncoder()
+  const a = enc.encode(given)
+  const b = enc.encode(expected)
+  const ok = a.byteLength === b.byteLength && crypto.subtle.timingSafeEqual(a, b)
+
+  if (!ok) {
+    return c.json({ error: 'Unauthorized' }, 401)
+  }
+  await next()
+})
 
 // ========================================
 // ヘルスチェック
