@@ -1,4 +1,11 @@
 // iTunes RSS APIからレビューを取得してD1に保存
+//
+// 【2026-09-29 変更】取得エラーと「0件」を区別する
+// 以前は HTTP エラーも例外も [] を返し、呼び出し側は「空だった」として
+// last_fetched_at を更新していた。403（レート制限）も成功扱いになり、
+// App Store から消えたアプリがあっても永久に気づけなかった。
+// 今は失敗を tracked_apps.fetch_error_streak に記録し、週報で名前が出る。
+// レート制限（403/429）を受けたら、その回は残りのアプリを叩かずに止める。
 
 interface TrackedApp {
   id: number
@@ -45,7 +52,15 @@ function parseReviews(json: any): RawReview[] {
 }
 
 // 1つのアプリのレビューを取得（1ページ = 最大50件）
-async function fetchAppReviews(appleId: string, page: number = 1): Promise<RawReview[]> {
+// 取得結果。「空だった」（ok:true, reviews:[]）と「失敗した」（ok:false）を区別する
+type FetchResult =
+  | { ok: true; reviews: RawReview[] }
+  | { ok: false; status: number | null; message: string }
+
+// レート制限とみなす HTTP ステータス。受けたら、その回の残りのアプリは叩かない
+const RATE_LIMIT_STATUSES = new Set([403, 429])
+
+async function fetchAppReviews(appleId: string, page: number = 1): Promise<FetchResult> {
   const url = `https://itunes.apple.com/us/rss/customerreviews/page=${page}/id=${appleId}/sortBy=mostRecent/json`
 
   try {
@@ -59,24 +74,42 @@ async function fetchAppReviews(appleId: string, page: number = 1): Promise<RawRe
     })
     if (!res.ok) {
       console.error(`  HTTP ${res.status} for app ${appleId}`)
-      return []
+      return { ok: false, status: res.status, message: `HTTP ${res.status}` }
     }
     const json = await res.json()
-    return parseReviews(json)
+    return { ok: true, reviews: parseReviews(json) }
   } catch (e) {
     console.error(`  Fetch error for app ${appleId}:`, e)
-    return []
+    return { ok: false, status: null, message: String(e).substring(0, 200) }
   }
+}
+
+// 成功（0件を含む）: last_fetched_at を進め、エラー記録をクリア
+async function markFetched(db: D1Database, appId: number): Promise<void> {
+  await db.prepare(
+    "UPDATE tracked_apps SET last_fetched_at = datetime('now'), fetch_error_streak = 0, last_fetch_error = NULL WHERE id = ?"
+  ).bind(appId).run()
+}
+
+// 失敗: last_fetched_at は進める（ローテーションは時間ベースなので、
+// 壊れたアプリが枠を独占することはない。次の周回で自然に再試行される）。
+// 連続回数と内容を残し、週報で名前つきで見えるようにする。
+async function markFetchFailed(db: D1Database, appId: number, message: string): Promise<void> {
+  await db.prepare(
+    "UPDATE tracked_apps SET last_fetched_at = datetime('now'), fetch_error_streak = fetch_error_streak + 1, last_fetch_error = ? WHERE id = ?"
+  ).bind(message, appId).run()
 }
 // 全トラッキングアプリのレビューを取得してD1に保存
 export async function fetchAndStoreReviews(db: D1Database): Promise<{
   appsProcessed: number
   newReviews: number
   errors: number
+  rateLimited: boolean
 }> {
   let appsProcessed = 0
   let newReviews = 0
   let errors = 0
+  let rateLimited = false
 
   // トラッキング対象アプリを取得
   const apps = await db.prepare(
@@ -85,7 +118,7 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
 
   if (!apps.results || apps.results.length === 0) {
     console.log('No tracked apps found')
-    return { appsProcessed: 0, newReviews: 0, errors: 0 }
+    return { appsProcessed: 0, newReviews: 0, errors: 0, rateLimited: false }
   }
 
   console.log(`Processing ${apps.results.length} apps...`)
@@ -95,15 +128,33 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
       console.log(`  Fetching: ${app.app_name} (${app.apple_id})`)
 
       // レビュー取得（1ページ目のみ、最大50件）
-      const reviews = await fetchAppReviews(app.apple_id)
+      const result = await fetchAppReviews(app.apple_id)
+
+      if (!result.ok) {
+        // 失敗。「空だった」とは別物として記録する
+        await markFetchFailed(db, app.id, result.message)
+        errors++
+        console.log(`    Fetch failed (${result.message}) — recorded`)
+
+        // レート制限なら、残りのアプリを叩いても悪化するだけ。この回は止める。
+        // 残りは last_fetched_at が古いままなので、次回の先頭に来る
+        if (result.status != null && RATE_LIMIT_STATUSES.has(result.status)) {
+          console.warn(`    Rate limited by Apple (HTTP ${result.status}) — stopping this run`)
+          rateLimited = true
+          break
+        }
+        await new Promise(r => setTimeout(r, 1500))
+        continue
+      }
+
+      const reviews = result.reviews
       console.log(`    Found ${reviews.length} reviews`)
 
       if (reviews.length === 0) {
-        // last_fetched_at を更新（空でもフェッチ済みとする）
-        await db.prepare(
-          "UPDATE tracked_apps SET last_fetched_at = datetime('now') WHERE id = ?"
-        ).bind(app.id).run()
+        // 本当に空（App Store 側にレビューが無い）。成功扱い
+        await markFetched(db, app.id)
         appsProcessed++
+        await new Promise(r => setTimeout(r, 1500))
         continue
       }
 
@@ -133,23 +184,20 @@ export async function fetchAndStoreReviews(db: D1Database): Promise<{
       newReviews += inserted
       console.log(`    Inserted ${inserted} new reviews (${reviews.length - inserted} duplicates skipped)`)
 
-      // last_fetched_at を更新
-      await db.prepare(
-        "UPDATE tracked_apps SET last_fetched_at = datetime('now') WHERE id = ?"
-      ).bind(app.id).run()
-
+      await markFetched(db, app.id)
       appsProcessed++
 
       // Rate limit: 1.5秒待機
       await new Promise(r => setTimeout(r, 1500))
 
     } catch (e) {
+      // DB 側の例外。取得自体は成功している可能性があるので streak には数えない
       console.error(`  Error processing ${app.app_name}:`, e)
       errors++
     }
   }
 
-  return { appsProcessed, newReviews, errors }
+  return { appsProcessed, newReviews, errors, rateLimited }
 }
 
 
@@ -207,7 +255,13 @@ export async function deepBackfillReviews(
     try {
       // pages 2..MAX_PAGES を取得（page 1 は通常cron担当）
       for (let page = 2; page <= MAX_PAGES; page++) {
-        const reviews = await fetchAppReviews(app.apple_id, page)
+        const result = await fetchAppReviews(app.apple_id, page)
+        if (!result.ok) {
+          // 深掘りは一度きりの補完なので、失敗したページは飛ばして次のアプリへ
+          console.warn(`  ${app.app_name} p${page}: ${result.message} — skipping app`)
+          break
+        }
+        const reviews = result.reviews
         if (reviews.length === 0) break // Apple側にもうレビューが無い
 
         const batch = reviews.map(r =>

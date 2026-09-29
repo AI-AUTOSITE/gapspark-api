@@ -136,11 +136,12 @@ type PipelineHealth = {
   rotating: number    // window_offset > 0 のアプリ数
   maxOffset: number
   total: number
-  broken: { app_name: string; error_streak: number }[]   // 連続エラー3回以上
+  broken: { app_name: string; error_streak: number }[]   // 生成が連続エラー3回以上
+  fetchBroken: { app_name: string; streak: number; last_error: string | null }[]  // 取得が連続失敗2回以上
 }
 
 async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
-  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [] }
+  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [] }
   try {
     const st = await db.prepare(`
       SELECT empty_streak AS streak, COUNT(*) AS apps
@@ -169,6 +170,18 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
       LIMIT 10
     `).all<{ app_name: string; error_streak: number }>()
     out.broken = (br.results ?? []).map(r => ({ app_name: r.app_name, error_streak: Number(r.error_streak) }))
+
+    // レビュー取得が連続で失敗しているアプリ（Apple 側の問題・ストアから消えた等）
+    const fb = await db.prepare(`
+      SELECT app_name, fetch_error_streak AS streak, last_fetch_error AS last_error
+      FROM tracked_apps
+      WHERE fetch_error_streak >= 2
+      ORDER BY fetch_error_streak DESC
+      LIMIT 10
+    `).all<{ app_name: string; streak: number; last_error: string | null }>()
+    out.fetchBroken = (fb.results ?? []).map(r => ({
+      app_name: r.app_name, streak: Number(r.streak), last_error: r.last_error ?? null,
+    }))
   } catch (e) {
     console.error('getPipelineHealth failed:', e)
   }
@@ -204,9 +217,13 @@ function healthTableHtml(h: PipelineHealth): string {
   if (h.total === 0) return ''
   const streakRows = h.streaks.map(r => `<tr><td>${r.streak}回</td><td>${r.apps}</td></tr>`).join('')
   const brokenHtml = h.broken.length === 0
-    ? `<p style="font-size:13px">連続エラー3回以上のアプリ: なし</p>`
-    : `<p style="font-size:13px;color:#c00"><b>連続エラー3回以上のアプリ（壊れている可能性）:</b></p>
+    ? `<p style="font-size:13px">生成の連続エラー3回以上: なし</p>`
+    : `<p style="font-size:13px;color:#c00"><b>生成の連続エラー3回以上（壊れている可能性）:</b></p>
        <ul style="font-size:13px;color:#c00">${h.broken.map(b => `<li>${b.app_name} — ${b.error_streak}回連続</li>`).join('')}</ul>`
+  const fetchHtml = h.fetchBroken.length === 0
+    ? `<p style="font-size:13px">レビュー取得の連続失敗2回以上: なし</p>`
+    : `<p style="font-size:13px;color:#c00"><b>レビュー取得の連続失敗2回以上（Apple側の問題か、ストアから消えた可能性）:</b></p>
+       <ul style="font-size:13px;color:#c00">${h.fetchBroken.map(b => `<li>${b.app_name} — ${b.streak}回連続（${b.last_error ?? '不明'}）</li>`).join('')}</ul>`
   return `
   <h3>パイプラインの状態</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
@@ -214,7 +231,8 @@ function healthTableHtml(h: PipelineHealth): string {
     ${streakRows}
   </table>
   <p style="font-size:13px">窓の回転: ${h.rotating} / ${h.total} アプリが途中の窓を読んでいる（最大 offset ${fmt(h.maxOffset)}）</p>
-  ${brokenHtml}`
+  ${brokenHtml}
+  ${fetchHtml}`
 }
 
 function decisionTableHtml(): string {
@@ -229,7 +247,9 @@ function decisionTableHtml(): string {
     <tr><td rowspan="2">連続空振り</td><td>0〜1回が大半</td><td>正常。窓を回転して掘っている</td></tr>
     <tr><td>3回以上が大半</td><td>1周しても出ないアプリが多い。窓が薄いか、重複除去が厳しすぎる可能性</td></tr>
     <tr><td rowspan="2">連続エラー</td><td>なし</td><td>正常</td></tr>
-    <tr><td>3回以上のアプリあり</td><td>そのアプリは「乾いている」のではなく「壊れている」。自動で待機に入るが、原因（レビュー取得・Workers AI）は人が見る</td></tr>
+    <tr><td>3回以上のアプリあり</td><td>そのアプリは「乾いている」のではなく「壊れている」。自動で待機に入るが、原因（Workers AI）は人が見る</td></tr>
+    <tr><td rowspan="2">レビュー取得の連続失敗</td><td>なし</td><td>正常</td></tr>
+    <tr><td>2回以上のアプリあり</td><td>403/429 は Apple のレート制限（放置で回復）。404 はストアから消えた可能性（apple_id 確認か追跡解除）</td></tr>
     <tr><td rowspan="2">レビュー取得（GitHub Actions）</td><td>緑✅が続く</td><td>OK（6時間ごとに自動取得）</td></tr>
     <tr><td>赤❌が出た</td><td>失敗通知メールが届く。Actionsログを確認（CFトークン失効・Apple側障害などを疑う）</td></tr>
   </table>
@@ -258,7 +278,9 @@ function weeklyReportHtml(stats: Stats, prev: PrevStats, trend: TrendRow[], heal
   const stuckRatio = health.total > 0 ? stuckApps / health.total : 0
 
   let recommend = `OK 順調です。直近7日で ${fmt(weekTotal)} 件のペインポイントが生成されています。GitHub Actions が6時間ごとにレビューを取得し、分析・生成まで自動で回っています。何もしなくて大丈夫。`
-  if (health.broken.length > 0) {
+  if (health.fetchBroken.length > 0) {
+    recommend = `注意: ${health.fetchBroken.length} 件のアプリでレビュー取得が連続失敗しています（下の「パイプラインの状態」に名前と内容あり）。HTTP 403/429 ならApple側のレート制限、404 ならストアから消えた可能性。apple_id の確認か、追跡から外す判断を。`
+  } else if (health.broken.length > 0) {
     recommend = `注意: ${health.broken.length} 件のアプリが連続でエラーになっています（下の「パイプラインの状態」に名前あり）。材料切れではなく故障です。そのアプリのレビュー取得か、Workers AI 側の状態を確認してください。他のアプリの生成は続いています。`
   } else if (zeroDays >= 2) {
     recommend = `注意: 直近6日のうち ${zeroDays} 日、生成がゼロでした。<b>アプリを足す前に</b>、下の「パイプラインの確認」を上から順に見てください。9月に同じ症状が出たとき、原因は材料切れではなく D1 の枠超過でした。`
