@@ -315,8 +315,8 @@ export async function generatePainPoints(
       // 2回連続で落ちたときだけ、その窓を飛ばす（永久ループ防止）。
       const r = await recordGenerationError(db, app, REVIEWS_PER_CALL)
       console.log(r.held
-        ? `    Window held — will retry the same reviews next time`
-        : `    Two consecutive errors on this window — skipping to ${r.nextOffset}`)
+        ? `    Window held — will retry the same reviews next time (error_streak=${r.errorStreak})`
+        : `    Skipping this window after repeated errors — next at ${r.nextOffset} (error_streak=${r.errorStreak})`)
       errors++
     }
   }

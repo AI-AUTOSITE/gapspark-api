@@ -136,10 +136,11 @@ type PipelineHealth = {
   rotating: number    // window_offset > 0 のアプリ数
   maxOffset: number
   total: number
+  broken: { app_name: string; error_streak: number }[]   // 連続エラー3回以上
 }
 
 async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
-  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0 }
+  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [] }
   try {
     const st = await db.prepare(`
       SELECT empty_streak AS streak, COUNT(*) AS apps
@@ -157,6 +158,17 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
     out.total = Number(rot?.total) || 0
     out.rotating = Number(rot?.rotating) || 0
     out.maxOffset = Number(rot?.max_offset) || 0
+
+    // 「乾いている」ではなく「壊れている」アプリを名前つきで出す
+    const br = await db.prepare(`
+      SELECT ta.app_name AS app_name, g.error_streak AS error_streak
+      FROM app_generation_state g
+      JOIN tracked_apps ta ON ta.id = g.app_id
+      WHERE g.error_streak >= 3
+      ORDER BY g.error_streak DESC
+      LIMIT 10
+    `).all<{ app_name: string; error_streak: number }>()
+    out.broken = (br.results ?? []).map(r => ({ app_name: r.app_name, error_streak: Number(r.error_streak) }))
   } catch (e) {
     console.error('getPipelineHealth failed:', e)
   }
@@ -191,13 +203,18 @@ function trendTableHtml(trend: TrendRow[]): string {
 function healthTableHtml(h: PipelineHealth): string {
   if (h.total === 0) return ''
   const streakRows = h.streaks.map(r => `<tr><td>${r.streak}回</td><td>${r.apps}</td></tr>`).join('')
+  const brokenHtml = h.broken.length === 0
+    ? `<p style="font-size:13px">連続エラー3回以上のアプリ: なし</p>`
+    : `<p style="font-size:13px;color:#c00"><b>連続エラー3回以上のアプリ（壊れている可能性）:</b></p>
+       <ul style="font-size:13px;color:#c00">${h.broken.map(b => `<li>${b.app_name} — ${b.error_streak}回連続</li>`).join('')}</ul>`
   return `
   <h3>パイプラインの状態</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
     <tr style="background:#f0f0f0"><th>連続空振り（1周まるごと）</th><th>アプリ数</th></tr>
     ${streakRows}
   </table>
-  <p style="font-size:13px">窓の回転: ${h.rotating} / ${h.total} アプリが途中の窓を読んでいる（最大 offset ${fmt(h.maxOffset)}）</p>`
+  <p style="font-size:13px">窓の回転: ${h.rotating} / ${h.total} アプリが途中の窓を読んでいる（最大 offset ${fmt(h.maxOffset)}）</p>
+  ${brokenHtml}`
 }
 
 function decisionTableHtml(): string {
@@ -211,6 +228,8 @@ function decisionTableHtml(): string {
     <tr><td>0の日が続く</td><td><b>先に「パイプラインの確認」</b>（下）。材料切れと決めるのはその後</td></tr>
     <tr><td rowspan="2">連続空振り</td><td>0〜1回が大半</td><td>正常。窓を回転して掘っている</td></tr>
     <tr><td>3回以上が大半</td><td>1周しても出ないアプリが多い。窓が薄いか、重複除去が厳しすぎる可能性</td></tr>
+    <tr><td rowspan="2">連続エラー</td><td>なし</td><td>正常</td></tr>
+    <tr><td>3回以上のアプリあり</td><td>そのアプリは「乾いている」のではなく「壊れている」。自動で待機に入るが、原因（レビュー取得・Workers AI）は人が見る</td></tr>
     <tr><td rowspan="2">レビュー取得（GitHub Actions）</td><td>緑✅が続く</td><td>OK（6時間ごとに自動取得）</td></tr>
     <tr><td>赤❌が出た</td><td>失敗通知メールが届く。Actionsログを確認（CFトークン失効・Apple側障害などを疑う）</td></tr>
   </table>
@@ -239,7 +258,9 @@ function weeklyReportHtml(stats: Stats, prev: PrevStats, trend: TrendRow[], heal
   const stuckRatio = health.total > 0 ? stuckApps / health.total : 0
 
   let recommend = `OK 順調です。直近7日で ${fmt(weekTotal)} 件のペインポイントが生成されています。GitHub Actions が6時間ごとにレビューを取得し、分析・生成まで自動で回っています。何もしなくて大丈夫。`
-  if (zeroDays >= 2) {
+  if (health.broken.length > 0) {
+    recommend = `注意: ${health.broken.length} 件のアプリが連続でエラーになっています（下の「パイプラインの状態」に名前あり）。材料切れではなく故障です。そのアプリのレビュー取得か、Workers AI 側の状態を確認してください。他のアプリの生成は続いています。`
+  } else if (zeroDays >= 2) {
     recommend = `注意: 直近6日のうち ${zeroDays} 日、生成がゼロでした。<b>アプリを足す前に</b>、下の「パイプラインの確認」を上から順に見てください。9月に同じ症状が出たとき、原因は材料切れではなく D1 の枠超過でした。`
   } else if (stuckRatio >= 0.6) {
     recommend = `注意: ${stuckApps} / ${health.total} アプリが「1周まるごと空振り」を3回以上続けています。生成は動いていますが、窓が薄いか重複除去が厳しすぎる可能性があります。生成されたタイトルの質を目視で確認してください。`

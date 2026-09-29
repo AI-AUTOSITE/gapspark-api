@@ -224,9 +224,20 @@ export async function refreshAppStatsCache(
 const BASE_COOLDOWN_HOURS = 6      // 空振り0回のときの待ち時間（=3時間cron 2回分）
 const MAX_BACKOFF_STEPS = 6        // 2^6 = 64 → 384時間（16日）で頭打ち
 
-/** 連続空振り回数から、次に試すまでの待ち時間（時間）を求める */
-export function cooldownHours(emptyStreak: number): number {
-  const steps = Math.min(Math.max(emptyStreak, 0), MAX_BACKOFF_STEPS)
+/**
+ * 次に試すまでの待ち時間（時間）を求める。
+ *
+ * 段数 = max(空振り周回数, エラー連続回数 − 1)
+ *   空振り: 1周まるごと何も出なかった回数（材料が薄い）
+ *   エラー: 連続して落ちた回数（壊れている）。1回目は待ちを伸ばさない
+ *
+ * 「乾いている」と「壊れている」は別の状態だが、どちらも待たせる理由になる。
+ * 別々に数えて、長いほうを採用する。
+ */
+export function cooldownHours(emptyStreak: number, errorStreak = 0): number {
+  const fromEmpty = Math.max(emptyStreak, 0)
+  const fromError = Math.max(errorStreak - 1, 0)
+  const steps = Math.min(Math.max(fromEmpty, fromError), MAX_BACKOFF_STEPS)
   return BASE_COOLDOWN_HOURS * Math.pow(2, steps)
 }
 
@@ -292,7 +303,7 @@ export async function readCandidateApps(
     // SQLite の datetime('now') は "YYYY-MM-DD HH:MM:SS"（UTC）形式
     const attempted = Date.parse(row.last_attempted_at.replace(' ', 'T') + 'Z')
     if (!Number.isFinite(attempted)) return true   // 壊れた値なら対象に含める
-    const waitMs = cooldownHours(num(row.empty_streak)) * 3600_000
+    const waitMs = cooldownHours(num(row.empty_streak), num(row.error_streak)) * 3600_000
     return now - attempted >= waitMs
   })
 
@@ -303,6 +314,9 @@ export async function readCandidateApps(
     const aStreak = num(a.empty_streak)
     const bStreak = num(b.empty_streak)
     if (aStreak !== bStreak) return aStreak - bStreak
+    const aErr = num(a.error_streak)
+    const bErr = num(b.error_streak)
+    if (aErr !== bErr) return aErr - bErr   // 落ち続けているアプリは後回し
     if (a.existing_pain_points !== b.existing_pain_points) {
       return a.existing_pain_points - b.existing_pain_points
     }
@@ -385,11 +399,13 @@ export async function recordGenerationAttempt(
 /**
  * 生成が例外で落ちたときの記録。「空だった」とは区別する。
  *
- *   1回目のエラー: 窓は動かさない。待機だけ記録し、次回は同じ窓を読み直す
- *   2回目連続:     その窓は飛ばす（同じ窓で永久に落ち続けるのを防ぐ）。
- *                  飛ばした窓は empty_streak / cycle_created に数えない
+ *   奇数回目のエラー: 窓は動かさない。次回は同じ窓を読み直す
+ *   偶数回目:         その窓は飛ばす（同じ窓で永久に落ち続けるのを防ぐ）。
+ *                     飛ばした窓は empty_streak / cycle_created に数えない
  *
- * 一時的な Workers AI の不調で50件が1周ぶん飛ばされるのを防ぐための区別。
+ * error_streak は窓を飛ばしても【リセットしない】。成功したときだけ 0 に戻る。
+ * リセットすると、常に落ちるアプリが6時間おきに永久に選ばれ続ける
+ * （#4 で直した空回りと同じ形）。連続回数がそのまま待機時間に効く。
  */
 const MAX_ERRORS_PER_WINDOW = 2
 
@@ -397,9 +413,9 @@ export async function recordGenerationError(
   db: D1Database,
   app: Pick<CandidateApp, 'app_id' | 'negative_count' | 'window_offset' | 'error_streak' | 'cycle_created'>,
   windowSize: number
-): Promise<{ held: boolean; nextOffset: number }> {
+): Promise<{ held: boolean; nextOffset: number; errorStreak: number }> {
   const errors = app.error_streak + 1
-  const skip = errors >= MAX_ERRORS_PER_WINDOW
+  const skip = errors % MAX_ERRORS_PER_WINDOW === 0   // 2回ごとに1窓飛ばす
 
   let nextOffset = app.window_offset
   let nextCycleCreated = app.cycle_created
@@ -423,12 +439,12 @@ export async function recordGenerationError(
         error_streak      = ?,
         updated_at        = datetime('now')
     `).bind(
-      app.app_id, nextOffset, nextCycleCreated, skip ? 0 : errors,
-      nextOffset, nextCycleCreated, skip ? 0 : errors
+      app.app_id, nextOffset, nextCycleCreated, errors,
+      nextOffset, nextCycleCreated, errors
     ).run()
   } catch (e) {
     console.error(`recordGenerationError failed for app ${app.app_id}:`, e)
   }
 
-  return { held: !skip, nextOffset }
+  return { held: !skip, nextOffset, errorStreak: errors }
 }
