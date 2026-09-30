@@ -50,7 +50,7 @@ function stripHtml(html: string): string {
 }
 
 // HN Algolia でコメントを検索
-async function searchHackerNews(brand: string, hits: number): Promise<HNComment[]> {
+async function searchHackerNews(brand: string, hits: number): Promise<HNComment[] | null> {
   const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(
     brand
   )}&tags=comment&hitsPerPage=${hits}`
@@ -78,8 +78,11 @@ async function searchHackerNews(brand: string, hits: number): Promise<HNComment[
     }
     return results
   } catch (e) {
+    // 【2026-09-30 変更】失敗を [] で返さず null で返す。
+    // [] は「検索したが該当なし」、null は「検索できなかった」。
+    // 呼び出し側は null のとき offset を進めず、次回同じ5アプリを再試行する。
     console.error(`  HN fetch error for "${brand}":`, e)
-    return []
+    return null
   }
 }
 
@@ -93,6 +96,7 @@ export async function fetchHackerNewsMentions(
   newComments: number
   done: boolean
   next_offset: number
+  fetchErrors: number
 }> {
   const totalRow = await db
     .prepare('SELECT COUNT(*) as cnt FROM tracked_apps')
@@ -112,12 +116,13 @@ export async function fetchHackerNewsMentions(
      VALUES (?, ?, ?, 3, ?, ?, '', 'hackernews', ?)`
   )
 
-  // 実際の新規挿入数は INSERT OR IGNORE 前後の行数差で正確に測る
-  // （D1 の batch() の meta.changes は挿入行数と一致しないため使わない）
-  const beforeRow = await db
-    .prepare("SELECT COUNT(*) as cnt FROM reviews WHERE region = 'hackernews'")
-    .first<{ cnt: number }>()
-  const before = beforeRow?.cnt || 0
+  // 【2026-09-30 変更】新規挿入数の数え方を変更。
+  // 以前は INSERT 前後で COUNT(*) WHERE region='hackernews' を2回実行していたが、
+  // region に索引が無いため reviews 全件（約23万行）のフルスキャン×2。
+  // 6時間cronで1日4回 = 約190万行/日で、D1読み取りの最大の消費源だった。
+  // 今は「これから入れるIDのうち、既に存在する数」を UNIQUE 索引で引く（1アプリ数十行）。
+  let newComments = 0
+  let fetchErrors = 0
 
   for (const app of rows) {
     const brand = brandName(app.app_name)
@@ -127,10 +132,28 @@ export async function fetchHackerNewsMentions(
     }
 
     const comments = await searchHackerNews(brand, HITS_PER_APP)
+    if (comments === null) {
+      // 検索できなかった（Algolia のエラー等）。「該当なし」とは別物。
+      fetchErrors++
+      await new Promise((r) => setTimeout(r, 700))
+      continue
+    }
     // ブランド名が本文に実際に含まれるものだけ採用（無関係ヒットのノイズ低減）
     const relevant = comments.filter((c) => c.text.toLowerCase().includes(brand.toLowerCase()))
 
     if (relevant.length > 0) {
+      // UNIQUE(tracked_app_id, review_id, region) の索引で、既存分だけ数える
+      const ids = relevant.map((c) => `hn-${c.objectID}`)
+      const placeholders = ids.map(() => '?').join(',')
+      const existingRow = await db
+        .prepare(
+          `SELECT COUNT(*) as cnt FROM reviews
+           WHERE tracked_app_id = ? AND region = 'hackernews' AND review_id IN (${placeholders})`
+        )
+        .bind(app.id, ...ids)
+        .first<{ cnt: number }>()
+      const existing = existingRow?.cnt || 0
+
       const batch = relevant.map((c) =>
         insertStmt.bind(
           app.id,
@@ -142,6 +165,7 @@ export async function fetchHackerNewsMentions(
         )
       )
       await db.batch(batch)
+      newComments += relevant.length - existing
     }
     console.log(`  HN "${brand}": ${relevant.length} relevant matches`)
 
@@ -149,19 +173,20 @@ export async function fetchHackerNewsMentions(
     await new Promise((r) => setTimeout(r, 700))
   }
 
-  const afterRow = await db
-    .prepare("SELECT COUNT(*) as cnt FROM reviews WHERE region = 'hackernews'")
-    .first<{ cnt: number }>()
-  const newComments = (afterRow?.cnt || 0) - before
-
   const processed = rows.length
-  const next_offset = offset + processed
-  const done = next_offset >= total || processed === 0
+
+  // 全部失敗 = Algolia 側の障害。offset を進めず、次回同じ5アプリを再試行する。
+  // 一部だけ失敗 = そのアプリ固有の問題の可能性。進める（次の周回で戻ってくる）。
+  // 「全部失敗でも進める」と障害中の5アプリを飛ばし、「1つでも失敗で止める」と
+  // 壊れた1アプリで巡回全体が止まる。その中間を取る。
+  const allFailed = processed > 0 && fetchErrors === processed
+  const next_offset = allFailed ? offset : offset + processed
+  const done = !allFailed && (next_offset >= total || processed === 0)
 
   console.log(
-    `HN backfill: offset=${offset} processed=${processed} newComments=${newComments} total=${total} done=${done}`
+    `HN backfill: offset=${offset} processed=${processed} newComments=${newComments} fetchErrors=${fetchErrors} total=${total} done=${done}`
   )
-  return { total, offset, processed, newComments, done, next_offset }
+  return { total, offset, processed, newComments, done, next_offset, fetchErrors }
 }
 
 
@@ -170,7 +195,7 @@ export async function fetchHackerNewsMentions(
 // マイグレーション不要（monitor_state の key-value を再利用）。
 export async function runHackerNewsCron(
   db: D1Database
-): Promise<{ offset: number; nextOffset: number; newComments: number; done: boolean }> {
+): Promise<{ offset: number; nextOffset: number; newComments: number; done: boolean; fetchErrors: number }> {
   // 現在の巡回位置を取得
   const stateRow = await db
     .prepare("SELECT value FROM monitor_state WHERE key = 'hn_offset'")
@@ -190,5 +215,5 @@ export async function runHackerNewsCron(
     .run()
 
   console.log(`HN cron: offset=${offset} -> next=${nextOffset} newComments=${result.newComments}`)
-  return { offset, nextOffset, newComments: result.newComments, done: result.done }
+  return { offset, nextOffset, newComments: result.newComments, done: result.done, fetchErrors: result.fetchErrors }
 }

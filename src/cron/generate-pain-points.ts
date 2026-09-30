@@ -703,8 +703,13 @@ function parseLlamaResponse(response: string): ExtractedPainPoint[] {
     }
   } catch {}
 
-  console.error('  Failed to parse Llama response:', cleaned.substring(0, 200))
-  return []
+  // 【2026-09-30 変更】読めなかったときは [] ではなく例外にする。
+  // [] は「モデルが読んで、該当なしと答えた」。読めないのは「壊れている」。
+  // [] で返すと呼び出し側が「この窓は空」として窓を進めてしまい、
+  // モデル側の一時的な不調で50件が1周ぶん飛ばされる。
+  // 例外なら呼び出し側の retry（スキーマ無しで再試行）→ recordGenerationError に流れる。
+  console.error('  Failed to parse model response:', cleaned.substring(0, 200))
+  throw new Error(`Unparseable model response: ${cleaned.substring(0, 80)}`)
 }
 
 // related_topics に紛れ込むメタラベル（トピックじゃない語）。パース時に除去する保険。
@@ -879,8 +884,12 @@ async function savePainPoints(
     const results = await db.batch(batch)
     return results.reduce((sum, r) => sum + (r.meta?.changes || 0), 0)
   } catch (e) {
+    // 【2026-09-30 変更】0 を返さず例外にする。
+    // 0 を返すと「生成したが1件も採用されなかった（空）」と区別がつかず、
+    // 窓が進んで、生成済みのペインポイントが二度と保存されない。
+    // 例外なら呼び出し側が窓を保持し、次回同じ窓を再生成して保存し直す。
     console.error(`  DB insert error for ${app.app_name}:`, e)
-    return 0
+    throw e
   }
 }
 
