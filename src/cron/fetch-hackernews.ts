@@ -50,7 +50,7 @@ function stripHtml(html: string): string {
 }
 
 // HN Algolia でコメントを検索
-async function searchHackerNews(brand: string, hits: number): Promise<HNComment[] | null> {
+export async function searchHackerNews(brand: string, hits: number): Promise<HNComment[] | null> {
   const url = `https://hn.algolia.com/api/v1/search?query=${encodeURIComponent(
     brand
   )}&tags=comment&hitsPerPage=${hits}`
@@ -58,8 +58,9 @@ async function searchHackerNews(brand: string, hits: number): Promise<HNComment[
   try {
     const res = await fetch(url, { headers: { 'User-Agent': 'GapSpark/1.0' } })
     if (!res.ok) {
+      // HTTP エラーも「該当なし」ではなく「検索できなかった」
       console.error(`  HN HTTP ${res.status} for "${brand}"`)
-      return []
+      return null
     }
     const json: any = await res.json()
     const results: HNComment[] = []
@@ -203,6 +204,13 @@ export async function runHackerNewsCron(
   const offset = parseInt(stateRow?.value || '0') || 0
 
   const result = await fetchHackerNewsMentions(db, offset)
+
+  // 【2026-09-30 追加】失敗数を残す。数えるだけでログに埋もれると、
+  // 毎回1本だけ失敗するアプリが永久に飛ばされても誰も気づかない。週報が読む。
+  await db.prepare(`
+    INSERT INTO monitor_state (key, value, updated_at) VALUES ('hn_last_fetch_errors', ?, datetime('now'))
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+  `).bind(String(result.fetchErrors)).run()
 
   // 次の位置（末尾=done なら 0 に巻き戻して巡回を継続）
   const nextOffset = result.done ? 0 : result.next_offset

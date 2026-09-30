@@ -51,7 +51,7 @@ const REVIEW_BODY_CHARS = 300      // レビュー本文の切り詰め長（1B�
 const KNOWN_TITLES_IN_PROMPT = 20  // 「既知のペイン」として渡す件数（1Bは10）
 const MAX_OUTPUT_TOKENS = 1500     // 2〜4件のペインポイント分
 
-interface AppWithReviews {
+export interface AppWithReviews {
   app_id: number
   app_name: string
   category: string
@@ -67,7 +67,7 @@ interface NegativeReview {
   review_date: string | null
 }
 
-interface ExtractedPainPoint {
+export interface ExtractedPainPoint {
   title: string
   summary: string
   keywords: string[]
@@ -76,7 +76,7 @@ interface ExtractedPainPoint {
   ai_generated_idea: string
 }
 
-interface ScoredPainPoint extends ExtractedPainPoint {
+export interface ScoredPainPoint extends ExtractedPainPoint {
   ruleBasedScore: number
   reviewCount: number
   matchingReviewCount: number  // 純粋なキーワード一致レビュー数（足切り判定用）
@@ -668,7 +668,7 @@ function salvageTruncatedJsonArray(text: string): unknown[] | null {
   }
 }
 
-function parseLlamaResponse(response: string): ExtractedPainPoint[] {
+export function parseLlamaResponse(response: string): ExtractedPainPoint[] {
   // ```json ... ``` のマークダウン柵を外す（「JSON only」と指示しても付けてくる）
   const cleaned = response.replace(/```(?:json)?/gi, '').trim()
 
@@ -846,7 +846,7 @@ async function computeSignal(
   }
 }
 
-async function savePainPoints(
+export async function savePainPoints(
   db: D1Database,
   app: AppWithReviews & { negative_count?: number },
   painPoints: ScoredPainPoint[]

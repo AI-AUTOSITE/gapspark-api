@@ -53,7 +53,7 @@ function parseReviews(json: any): RawReview[] {
 
 // 1つのアプリのレビューを取得（1ページ = 最大50件）
 // 取得結果。「空だった」（ok:true, reviews:[]）と「失敗した」（ok:false）を区別する
-type FetchResult =
+export type FetchResult =
   | { ok: true; reviews: RawReview[] }
   | { ok: false; status: number | null; message: string }
 
@@ -66,7 +66,7 @@ const HARD_RATE_LIMIT_STATUSES = new Set([429])
 const SOFT_RATE_LIMIT_STATUSES = new Set([403])
 const CONSECUTIVE_FAILURES_TO_STOP = 3
 
-async function fetchAppReviews(appleId: string, page: number = 1): Promise<FetchResult> {
+export async function fetchAppReviews(appleId: string, page: number = 1): Promise<FetchResult> {
   const url = `https://itunes.apple.com/us/rss/customerreviews/page=${page}/id=${appleId}/sortBy=mostRecent/json`
 
   try {

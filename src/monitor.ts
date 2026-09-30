@@ -138,10 +138,11 @@ type PipelineHealth = {
   total: number
   broken: { app_name: string; error_streak: number }[]   // 生成が連続エラー3回以上
   fetchBroken: { app_name: string; streak: number; last_error: string | null }[]  // 取得が連続失敗2回以上
+  hnLastFetchErrors: number   // 直近の HN 巡回で検索に失敗したアプリ数
 }
 
 async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
-  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [] }
+  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [], hnLastFetchErrors: 0 }
   try {
     const st = await db.prepare(`
       SELECT empty_streak AS streak, COUNT(*) AS apps
@@ -182,6 +183,8 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
     out.fetchBroken = (fb.results ?? []).map(r => ({
       app_name: r.app_name, streak: Number(r.streak), last_error: r.last_error ?? null,
     }))
+
+    out.hnLastFetchErrors = parseInt((await getState(db, 'hn_last_fetch_errors')) ?? '0') || 0
   } catch (e) {
     console.error('getPipelineHealth failed:', e)
   }
@@ -224,6 +227,9 @@ function healthTableHtml(h: PipelineHealth): string {
     ? `<p style="font-size:13px">レビュー取得の連続失敗2回以上: なし</p>`
     : `<p style="font-size:13px;color:#c00"><b>レビュー取得の連続失敗2回以上（Apple側の問題か、ストアから消えた可能性）:</b></p>
        <ul style="font-size:13px;color:#c00">${h.fetchBroken.map(b => `<li>${b.app_name} — ${b.streak}回連続（${b.last_error ?? '不明'}）</li>`).join('')}</ul>`
+  const hnHtml = h.hnLastFetchErrors === 0
+    ? `<p style="font-size:13px">Hacker News 検索の失敗（直近の巡回）: なし</p>`
+    : `<p style="font-size:13px;color:#c00"><b>Hacker News 検索の失敗（直近の巡回）: ${h.hnLastFetchErrors} 件</b> — Algolia 側の不調か、特定アプリの検索語が通らない可能性</p>`
   return `
   <h3>パイプラインの状態</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
@@ -232,7 +238,8 @@ function healthTableHtml(h: PipelineHealth): string {
   </table>
   <p style="font-size:13px">窓の回転: ${h.rotating} / ${h.total} アプリが途中の窓を読んでいる（最大 offset ${fmt(h.maxOffset)}）</p>
   ${brokenHtml}
-  ${fetchHtml}`
+  ${fetchHtml}
+  ${hnHtml}`
 }
 
 function decisionTableHtml(): string {
