@@ -71,6 +71,18 @@ jobs:
           fi
 
       # ② レビュー取得 → D1書き込み（新アプリ含む全 tracked_apps が対象）
+      #
+      # 【2026-09-30 変更】失敗と「0件」を区別する。
+      # 以前は curl の HTTP エラーも JSON 解析失敗も except で [] に化け、
+      # 「そのアプリにはレビューが無い」と同じ扱いだった。Apple のレート制限も、
+      # ストアから消えたアプリも、ジョブは緑のまま静かに素通りしていた。
+      # Worker 側の取得を外して Actions が唯一の取得経路になったので、ここで
+      # 失敗を tracked_apps.fetch_error_streak / last_fetch_error に記録し、
+      # 週報に名前が出るようにする（Worker 側 fetch-reviews.ts と同じ列・同じ意味）。
+      #   - HTTP エラー / JSON 不正 → 失敗（streak +1、理由を記録）
+      #   - 200 で 0 件           → 成功（空）。streak を 0 に戻す
+      #   - 429、または 403 が3連続 → レート制限。取れた分を保存してからジョブを赤にする
+      #   - 一部だけ失敗            → ジョブは緑。Actions の画面に警告を出す
       - name: Fetch reviews to D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -83,19 +95,60 @@ jobs:
           import json, subprocess, time, re
           apps = json.load(open("apps.json"))[0]["results"]
           print(f"==> {len(apps)} アプリのレビューを取得します")
+
           def esc(s):
               if s is None: return ""
               return re.sub(r"\s+", " ", str(s).replace("'", "''")).strip()
+
+          def fetch(url):
+              """(HTTPステータス, 本文) を返す。curl 自体が失敗したら (None, "")"""
+              try:
+                  r = subprocess.run(["curl","-s","-A","Mozilla/5.0","-w","\n%{http_code}",url],
+                                     capture_output=True, text=True, timeout=25)
+                  body, _, code = r.stdout.rpartition("\n")
+                  code = code.strip()
+                  return (int(code) if code.isdigit() else None), body
+              except Exception:
+                  return None, ""
+
           rows = []
+          ok_ids = []
+          failed = []            # (tracked_app id, 理由)
+          consecutive_403 = 0
+          rate_limited = False
+
           for a in apps:
               aid, tid = a["apple_id"], a["id"]
               url = f"https://itunes.apple.com/us/rss/customerreviews/page=1/id={aid}/sortby=mostrecent/json"
+              code, body = fetch(url)
+
+              # --- 失敗: HTTP エラー / 無応答 ---
+              if code != 200:
+                  reason = f"HTTP {code}" if code else "no response"
+                  failed.append((tid, reason))
+                  print(f"  ✗ id={tid} {reason}")
+                  consecutive_403 = consecutive_403 + 1 if code == 403 else 0
+                  if code == 429 or consecutive_403 >= 3:
+                      remaining = len(apps) - len(ok_ids) - len(failed)
+                      print(f"::error::Apple rate limit ({reason}, {consecutive_403} x 403 in a row). Stopping; {remaining} apps not attempted.")
+                      rate_limited = True
+                      break
+                  time.sleep(1.5)
+                  continue
+
+              # --- 失敗: 200 なのに JSON が読めない（エラーページなど） ---
               try:
-                  entries = json.loads(subprocess.run(["curl","-s","-A","Mozilla/5.0",url],
-                      capture_output=True,text=True,timeout=25).stdout).get("feed",{}).get("entry")
+                  entries = json.loads(body).get("feed", {}).get("entry")
                   entries = entries[1:] if isinstance(entries, list) else []
               except Exception:
-                  entries = []
+                  failed.append((tid, "bad json"))
+                  print(f"  ✗ id={tid} bad json")
+                  time.sleep(0.5)
+                  continue
+
+              # --- 成功（0件を含む） ---
+              consecutive_403 = 0
+              ok_ids.append(tid)
               for r in entries:
                   try:
                       rows.append(
@@ -109,18 +162,49 @@ jobs:
                   except Exception:
                       pass
               time.sleep(0.5)
-          print(f"==> 取得レビュー総数: {len(rows)}")
+
+          print(f"==> 成功 {len(ok_ids)} / 失敗 {len(failed)} / 取得レビュー {len(rows)}")
+
           COLS = "(tracked_app_id, review_id, author, rating, title, body, app_version, region, review_date)"
           out = []
           for i in range(0, len(rows), 50):
               out.append(f"INSERT OR IGNORE INTO reviews {COLS} VALUES")
               out.append(",\n".join(rows[i:i+50]) + ";")
+
+          # 成功したアプリ: 取得日時を進め、エラー記録を消す
+          if ok_ids:
+              out.append("UPDATE tracked_apps SET last_fetched_at = datetime('now'), "
+                         "fetch_error_streak = 0, last_fetch_error = NULL "
+                         f"WHERE id IN ({','.join(map(str, ok_ids))});")
+
+          # 失敗したアプリ: 連続回数を増やし、理由を残す（理由ごとにまとめる）
+          by_reason = {}
+          for tid, reason in failed:
+              by_reason.setdefault(reason, []).append(tid)
+          for reason, ids in by_reason.items():
+              out.append("UPDATE tracked_apps SET last_fetched_at = datetime('now'), "
+                         f"fetch_error_streak = fetch_error_streak + 1, last_fetch_error = '{esc(reason)}' "
+                         f"WHERE id IN ({','.join(map(str, ids))});")
+
           open("reviews.sql","w").write("\n".join(out) + "\n")
-          print(f"==> SQL生成完了: {(len(rows)+49)//50} 個のINSERT文")
+          print(f"==> SQL生成完了: INSERT {(len(rows)+49)//50} 文 + UPDATE {(1 if ok_ids else 0) + len(by_reason)} 文")
+
+          if failed:
+              detail = ", ".join(f"id={t} {r}" for t, r in failed[:10])
+              more = f" (+{len(failed)-10} more)" if len(failed) > 10 else ""
+              print(f"::warning::{len(failed)} app(s) failed to fetch: {detail}{more}")
+          if rate_limited:
+              open("rate_limited.flag","w").write("1")
           PYEOF
+          # 取れた分は必ず保存する（レート制限で途中停止しても、成功分は無駄にしない）
           if [ -s reviews.sql ]; then
             npx -y wrangler d1 execute gapspark-db --remote --file reviews.sql
             echo "==> D1書き込み 完了！"
           else
             echo "==> 取得0件。スキップ。"
+          fi
+          # 保存し終えてから、レート制限で止まった場合だけジョブを赤にする
+          if [ -f rate_limited.flag ]; then
+            echo "::error::Stopped by Apple rate limit. Partial results were saved; remaining apps will be fetched next run."
+            exit 1
           fi
