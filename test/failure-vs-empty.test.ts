@@ -22,6 +22,7 @@ import {
   type ScoredPainPoint,
   type AppWithReviews,
 } from '../src/cron/generate-pain-points'
+import { recordGenerationError } from '../src/stats'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -66,6 +67,14 @@ describe('fetchAppReviews: HTTP エラーは空リストではなく失敗とし
     if (!r.ok) expect(r.status).toBeNull()
   })
 
+  it('200 なのに本文が JSON でない（エラーページ等）→ ok:false', async () => {
+    // ステータスは正常でも本文が読めなければ「取れた」とは言えない。
+    // HN で catch 側しか直っていなかったのと同じ形の分岐。
+    fakeFetch(200, '<html>Service Unavailable</html>')
+    const r = await fetchAppReviews('916366645')
+    expect(r.ok).toBe(false)
+  })
+
   it('本当に空（メタデータ1件のみ）→ ok:true, reviews:[]', async () => {
     // Apple の RSS は先頭にアプリのメタデータが入る。レビュー0件ならそれだけ
     fakeFetch(200, { feed: { entry: [{ 'im:name': { label: 'App' } }] } })
@@ -95,6 +104,11 @@ describe('searchHackerNews: 失敗は null、該当なしは []', () => {
 
   it('例外 → null', async () => {
     fakeFetchThrows()
+    expect(await searchHackerNews('Notion', 20)).toBeNull()
+  })
+
+  it('200 なのに本文が JSON でない → null', async () => {
+    fakeFetch(200, '<html>maintenance</html>')
     expect(await searchHackerNews('Notion', 20)).toBeNull()
   })
 
@@ -139,24 +153,6 @@ describe('parseLlamaResponse: 読めない返答は例外、該当なしは []',
 // 4. 保存
 // ------------------------------------------------------------
 
-// D1 の偽物。prepare().bind().first() は信号計算用に固定値を返し、
-// batch() は指定に応じて成功するか例外を投げる。
-function fakeDb(opts: { batchThrows?: boolean } = {}) {
-  const stmt: any = {
-    bind: () => stmt,
-    first: async () => ({ cnt: 5 }),
-    run: async () => ({ meta: { changes: 1 } }),
-    all: async () => ({ results: [] }),
-  }
-  return {
-    prepare: () => stmt,
-    batch: async (stmts: unknown[]) => {
-      if (opts.batchThrows) throw new Error('D1_ERROR: database is locked')
-      return stmts.map(() => ({ meta: { changes: 1 } }))
-    },
-  }
-}
-
 const app: AppWithReviews & { negative_count?: number } = {
   app_id: 1, app_name: 'Test App', category: 'Productivity', tags: '[]', negative_count: 50,
 }
@@ -172,6 +168,65 @@ const painPoint: ScoredPainPoint = {
   reviewCount: 50,
   matchingReviewCount: 4,
 }
+
+// D1 の偽物。prepare().bind().first() は信号計算用に固定値を返し、
+// batch() は指定に応じて成功するか例外を投げる。
+// bind() に渡された引数を binds に記録する。「何を書こうとしたか」を検証できる。
+// 戻り値だけを見るテストは「正しく計算して、間違った値を書く」バグを見逃す
+// （ミューテーションテストで実際に見逃した）。
+function fakeDb(opts: { batchThrows?: boolean } = {}) {
+  const binds: unknown[][] = []
+  const stmt: any = {
+    bind: (...args: unknown[]) => { binds.push(args); return stmt },
+    first: async () => ({ cnt: 5 }),
+    run: async () => ({ meta: { changes: 1 } }),
+    all: async () => ({ results: [] }),
+  }
+  return {
+    binds,
+    prepare: () => stmt,
+    batch: async (stmts: unknown[]) => {
+      if (opts.batchThrows) throw new Error('D1_ERROR: database is locked')
+      return stmts.map(() => ({ meta: { changes: 1 } }))
+    },
+  }
+}
+
+// ------------------------------------------------------------
+// 5. 失敗の「その後」— 窓は保持され、エラーは記録される
+// ------------------------------------------------------------
+// 4 の throw は入口にすぎない。呼び出し側は例外を受けて recordGenerationError を
+// 呼ぶ。そこで「窓を進めない（次回同じ50件を読み直す）」「error_streak を刻む」が
+// 起きて初めて、失敗した結果は救われる。ここを固定する。
+describe('recordGenerationError: 失敗した窓は保持され、連続回数が刻まれる', () => {
+  const base = { app_id: 1, negative_count: 500, window_offset: 100, error_streak: 0, cycle_created: 0 }
+
+  // UPSERT の bind 順: (app_id, offset, cycle, error_streak, offset, cycle, error_streak)
+  // 戻り値ではなく「DB に書こうとした値」を見る
+  const written = (db: ReturnType<typeof fakeDb>) => {
+    const b = db.binds.at(-1)!
+    return { offset: b[1], errorStreak: b[3] }
+  }
+
+  it('1回目の失敗 → 窓は動かない、error_streak=1 が書かれる', async () => {
+    const db = fakeDb()
+    const r = await recordGenerationError(db as any, base, 50)
+    expect(r.held).toBe(true)
+    expect(written(db)).toEqual({ offset: 100, errorStreak: 1 })
+  })
+
+  it('2回目の連続失敗 → その窓だけ飛ばす、error_streak=2 が書かれる（リセットされない）', async () => {
+    const db = fakeDb()
+    const r = await recordGenerationError(db as any, { ...base, error_streak: 1 }, 50)
+    expect(r.held).toBe(false)
+    expect(written(db)).toEqual({ offset: 150, errorStreak: 2 })
+  })
+
+  it('記録の書き込み自体が失敗しても例外にならない（生成は成功しているため）', async () => {
+    const db = { prepare: () => ({ bind: () => ({ run: async () => { throw new Error('D1 down') } }) }) }
+    await expect(recordGenerationError(db as any, base, 50)).resolves.toBeTruthy()
+  })
+})
 
 describe('savePainPoints: 保存の失敗は 0 ではなく例外', () => {
   it('db.batch が落ちたら throw（0 を返して「空」に化けない）', async () => {
