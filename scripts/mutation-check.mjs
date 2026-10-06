@@ -67,6 +67,13 @@ const MUTATIONS = [
     before: '      app.app_id, nextOffset, nextCycleCreated, errors,\n      nextOffset, nextCycleCreated, errors',
     after:  '      app.app_id, nextOffset, nextCycleCreated, 0,\n      nextOffset, nextCycleCreated, 0',
   },
+  {
+    // 偽DB時代には検出できなかった種類。本物の SQLite で列名を読み戻すので落ちる
+    file: 'src/stats.ts',
+    label: 'recordGenerationError: INSERT の列順が入れ替わる（値が別の列に入る）',
+    before: '        (app_id, last_attempted_at, empty_streak, window_offset, cycle_created, error_streak, updated_at)',
+    after:  '        (app_id, last_attempted_at, empty_streak, error_streak, cycle_created, window_offset, updated_at)',
+  },
 ]
 
 function runTests() {

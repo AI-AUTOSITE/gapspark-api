@@ -2,18 +2,22 @@
 // 「失敗」と「空」は別の状態である — 回帰テスト
 // ============================================================
 //
-// 2026-09 に同じ形の穴が 4 箇所見つかった:
+// 2026-09 に同じ形の穴が 5 箇所見つかった:
 //   fetch が失敗しても []、モデルの返答が読めなくても []、保存が落ちても 0。
 //   呼び出し側はそれを「読んだが何も無かった」と解釈して先へ進み、
 //   失敗した仕事は静かに消えていた。
 //
-// このテストは、その 4 箇所が「失敗を空に化けさせない」ことを固定する。
+// このテストは、その箇所が「失敗を空に化けさせない」ことを固定する。
 // 直し方が変わっても、この性質が壊れたら落ちる。
 //
-// 実行: npm test
+// DB を触るテストは、本番スキーマを載せたメモリ上の SQLite に対して
+// 本物の SQL を流し、列名で読み戻す（test/helpers/sqlite-d1.ts）。
+//
+// 実行:         npm test
+// 守りの確認:   npm run test:mutate（修正を1つずつ戻して、落ちることを確認）
 // ============================================================
 
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
 import { fetchAppReviews } from '../src/cron/fetch-reviews'
 import { searchHackerNews } from '../src/cron/fetch-hackernews'
 import {
@@ -23,6 +27,7 @@ import {
   type AppWithReviews,
 } from '../src/cron/generate-pain-points'
 import { recordGenerationError } from '../src/stats'
+import { createTestDb, type TestDb } from './helpers/sqlite-d1'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -150,9 +155,8 @@ describe('parseLlamaResponse: 読めない返答は例外、該当なしは []',
 })
 
 // ------------------------------------------------------------
-// 4. 保存
+// 4. 保存 — 本物の SQLite に対して
 // ------------------------------------------------------------
-
 const app: AppWithReviews & { negative_count?: number } = {
   app_id: 1, app_name: 'Test App', category: 'Productivity', tags: '[]', negative_count: 50,
 }
@@ -169,74 +173,58 @@ const painPoint: ScoredPainPoint = {
   matchingReviewCount: 4,
 }
 
-// D1 の偽物。prepare().bind().first() は信号計算用に固定値を返し、
-// batch() は指定に応じて成功するか例外を投げる。
-// bind() に渡された引数を binds に記録する。「何を書こうとしたか」を検証できる。
-// 戻り値だけを見るテストは「正しく計算して、間違った値を書く」バグを見逃す
-// （ミューテーションテストで実際に見逃した）。
-function fakeDb(opts: { batchThrows?: boolean } = {}) {
-  const binds: unknown[][] = []
-  const stmt: any = {
-    bind: (...args: unknown[]) => { binds.push(args); return stmt },
-    first: async () => ({ cnt: 5 }),
-    run: async () => ({ meta: { changes: 1 } }),
-    all: async () => ({ results: [] }),
-  }
-  return {
-    binds,
-    prepare: () => stmt,
-    batch: async (stmts: unknown[]) => {
-      if (opts.batchThrows) throw new Error('D1_ERROR: database is locked')
-      return stmts.map(() => ({ meta: { changes: 1 } }))
-    },
-  }
-}
+describe('savePainPoints: 保存の失敗は 0 ではなく例外', () => {
+  let db: TestDb
+  beforeEach(() => { db = createTestDb() })
+
+  it('db.batch が落ちたら throw し、何も保存されていない', async () => {
+    db.failNextBatch()
+    await expect(savePainPoints(db as any, app, [painPoint])).rejects.toThrow()
+    const n = db.raw.prepare('SELECT COUNT(*) AS n FROM pain_points').get() as { n: number }
+    expect(n.n).toBe(0)
+  })
+
+  it('保存できたら件数を返し、行が実際に入っている', async () => {
+    const saved = await savePainPoints(db as any, app, [painPoint])
+    expect(saved).toBe(1)
+    const row = db.raw.prepare('SELECT title, severity_score FROM pain_points').get() as any
+    expect(row.title).toBe(painPoint.title)
+    expect(row.severity_score).toBeGreaterThan(0)
+  })
+})
 
 // ------------------------------------------------------------
 // 5. 失敗の「その後」— 窓は保持され、エラーは記録される
 // ------------------------------------------------------------
 // 4 の throw は入口にすぎない。呼び出し側は例外を受けて recordGenerationError を
-// 呼ぶ。そこで「窓を進めない（次回同じ50件を読み直す）」「error_streak を刻む」が
-// 起きて初めて、失敗した結果は救われる。ここを固定する。
-describe('recordGenerationError: 失敗した窓は保持され、連続回数が刻まれる', () => {
+// 呼ぶ。そこで「窓を進めない」「error_streak を刻む」が起きて初めて、失敗した
+// 結果は救われる。ここを固定する。
+//
+// 本物の UPSERT を流し、列名で読み戻す。以前は偽DBの bind 引数を見ていたが、
+// INSERT の列順が入れ替わっても配列の位置は合うので通ってしまった。
+// 列名で読めば、それは通らない。
+describe('recordGenerationError: 失敗した窓は保持され、連続回数が保存される', () => {
+  let db: TestDb
+  beforeEach(() => { db = createTestDb() })
+
   const base = { app_id: 1, negative_count: 500, window_offset: 100, error_streak: 0, cycle_created: 0 }
+  const readBack = () =>
+    db.raw.prepare('SELECT window_offset, error_streak FROM app_generation_state WHERE app_id = 1').get()
 
-  // UPSERT の bind 順: (app_id, offset, cycle, error_streak, offset, cycle, error_streak)
-  // 戻り値ではなく「DB に書こうとした値」を見る
-  const written = (db: ReturnType<typeof fakeDb>) => {
-    const b = db.binds.at(-1)!
-    return { offset: b[1], errorStreak: b[3] }
-  }
-
-  it('1回目の失敗 → 窓は動かない、error_streak=1 が書かれる', async () => {
-    const db = fakeDb()
+  it('1回目の失敗 → 窓は動かない、error_streak=1 が列に入る', async () => {
     const r = await recordGenerationError(db as any, base, 50)
     expect(r.held).toBe(true)
-    expect(written(db)).toEqual({ offset: 100, errorStreak: 1 })
+    expect(readBack()).toEqual({ window_offset: 100, error_streak: 1 })
   })
 
-  it('2回目の連続失敗 → その窓だけ飛ばす、error_streak=2 が書かれる（リセットされない）', async () => {
-    const db = fakeDb()
+  it('2回目の連続失敗 → その窓だけ飛ばす、error_streak=2（リセットされない）', async () => {
     const r = await recordGenerationError(db as any, { ...base, error_streak: 1 }, 50)
     expect(r.held).toBe(false)
-    expect(written(db)).toEqual({ offset: 150, errorStreak: 2 })
+    expect(readBack()).toEqual({ window_offset: 150, error_streak: 2 })
   })
 
   it('記録の書き込み自体が失敗しても例外にならない（生成は成功しているため）', async () => {
-    const db = { prepare: () => ({ bind: () => ({ run: async () => { throw new Error('D1 down') } }) }) }
+    db.raw.exec('DROP TABLE app_generation_state')
     await expect(recordGenerationError(db as any, base, 50)).resolves.toBeTruthy()
-  })
-})
-
-describe('savePainPoints: 保存の失敗は 0 ではなく例外', () => {
-  it('db.batch が落ちたら throw（0 を返して「空」に化けない）', async () => {
-    const db = fakeDb({ batchThrows: true })
-    await expect(savePainPoints(db as any, app, [painPoint])).rejects.toThrow()
-  })
-
-  it('保存できたら件数を返す', async () => {
-    const db = fakeDb()
-    const saved = await savePainPoints(db as any, app, [painPoint])
-    expect(saved).toBe(1)
   })
 })
