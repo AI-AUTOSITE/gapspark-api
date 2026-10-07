@@ -155,27 +155,55 @@ describe('parseLlamaResponse: 読めない返答は例外、該当なしは []',
 })
 
 // ------------------------------------------------------------
-// 4. 保存 — 本物の SQLite に対して
+// 4. 保存 — 本物の SQLite に対して、全列を読み戻す
 // ------------------------------------------------------------
+// 列の入れ替えミューテーション（npm run test:swap）で、13列×78ペアのうち
+// 56ペアが緑のまま残った。title と severity_score しか読み戻していなかったので、
+// 他の11列は何が入っても通っていた。今は全列を期待値と比べる。
+//
+// 種値は全列で違う値にする。2列が同じ値だと、入れ替えても同じ行になり、
+// 入れ替わっていることを検出できない。
+
+// 日付列は値ではなく形で確認する（datetime('now') の結果）
+const DATETIME = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/
+
 const app: AppWithReviews & { negative_count?: number } = {
-  app_id: 1, app_name: 'Test App', category: 'Productivity', tags: '[]', negative_count: 50,
+  app_id: 7, app_name: 'Test App', category: 'Productivity', tags: '[]', negative_count: 50,
 }
 
 const painPoint: ScoredPainPoint = {
   title: 'Sync fails after device sleep',
   summary: 'Changes made offline are lost when the device wakes and reconnects.',
   keywords: ['sync', 'offline', 'lost'],
-  related_topics: ['sync'],
+  related_topics: ['connectivity'],
   severity: 'critical',
   ai_generated_idea: 'SafeSync — a queue that survives sleep',
-  ruleBasedScore: 0.8,
-  reviewCount: 50,
+  ruleBasedScore: 0.8,    // → severity_score
+  reviewCount: 50,        // → frequency
   matchingReviewCount: 4,
+}
+
+// 信号計算（mention_count / sample_size）のための種レビュー。
+// ネガティブ5件のうち2件がキーワードに該当 → mention_count=2, sample_size=5。
+// 該当しない3件は sync/offline/lost/fails/device/sleep を含まない文にする
+// （LIKE '%lost%' は "almost" にも当たるので、部分文字列にも注意）。
+// ポジティブ1件は数えられないことの確認用。
+function seedReviews(db: TestDb) {
+  db.raw.exec(`INSERT INTO tracked_apps (id, apple_id, app_name, category) VALUES (7, '777', 'Test App', 'Productivity')`)
+  const ins = db.raw.prepare(`
+    INSERT INTO reviews (tracked_app_id, review_id, rating, title, body, region, sentiment_score, sentiment_label)
+    VALUES (7, ?, ?, ?, ?, 'us', ?, ?)`)
+  ins.run('r1', 1, 'Broken again', 'Sync drops every time the phone goes idle', -0.9, 'NEGATIVE')
+  ins.run('r2', 2, 'Data gone', 'Changes made offline vanish', -0.8, 'NEGATIVE')
+  ins.run('r3', 1, 'Pricing', 'Price went up again this month', -0.7, 'NEGATIVE')
+  ins.run('r4', 2, 'Ads', 'Too many ads on the home tab', -0.6, 'NEGATIVE')
+  ins.run('r5', 1, 'Font', 'Font is tiny on the settings page', -0.5, 'NEGATIVE')
+  ins.run('r6', 5, 'Great', 'Sync works great now', 0.9, 'POSITIVE')
 }
 
 describe('savePainPoints: 保存の失敗は 0 ではなく例外', () => {
   let db: TestDb
-  beforeEach(() => { db = createTestDb() })
+  beforeEach(() => { db = createTestDb(); seedReviews(db) })
 
   it('db.batch が落ちたら throw し、何も保存されていない', async () => {
     db.failNextBatch()
@@ -184,12 +212,29 @@ describe('savePainPoints: 保存の失敗は 0 ではなく例外', () => {
     expect(n.n).toBe(0)
   })
 
-  it('保存できたら件数を返し、行が実際に入っている', async () => {
+  it('保存できたら件数を返し、全列が期待どおりの値で入っている', async () => {
     const saved = await savePainPoints(db as any, app, [painPoint])
     expect(saved).toBe(1)
-    const row = db.raw.prepare('SELECT title, severity_score FROM pain_points').get() as any
-    expect(row.title).toBe(painPoint.title)
-    expect(row.severity_score).toBeGreaterThan(0)
+
+    const row = db.raw.prepare('SELECT * FROM pain_points').get() as Record<string, unknown>
+    const { id, created_at, last_updated_at, ...rest } = row
+    expect(rest).toEqual({
+      category: 'Productivity',
+      title: painPoint.title,
+      summary: painPoint.summary,
+      severity_score: 0.8,
+      frequency: 50,
+      sample_app_ids: '[7]',
+      keywords: '["sync","offline","lost"]',
+      related_topics: '["connectivity"]',
+      ai_generated_idea: painPoint.ai_generated_idea,
+      mention_count: 2,
+      sample_size: 5,
+      ai_model_used: 'workers-ai-mistral-small-3.1-24b',
+    })
+    expect(id).toBe(1)
+    expect(created_at).toMatch(DATETIME)
+    expect(last_updated_at).toMatch(DATETIME)
   })
 })
 
@@ -207,20 +252,31 @@ describe('recordGenerationError: 失敗した窓は保持され、連続回数�
   let db: TestDb
   beforeEach(() => { db = createTestDb() })
 
-  const base = { app_id: 1, negative_count: 500, window_offset: 100, error_streak: 0, cycle_created: 0 }
-  const readBack = () =>
-    db.raw.prepare('SELECT window_offset, error_streak FROM app_generation_state WHERE app_id = 1').get()
+  // 種値は全列で違う値に（app_id=7, cycle_created=3）。以前は app_id=1 /
+  // cycle_created=0 で、error_streak=1 や empty_streak=0 と同じ値になり、
+  // その列を入れ替えても検出できなかった。
+  const base = { app_id: 7, negative_count: 500, window_offset: 100, error_streak: 0, cycle_created: 3 }
 
-  it('1回目の失敗 → 窓は動かない、error_streak=1 が列に入る', async () => {
+  // 全列を読み戻す。日付列は形で、残りは値で確認する
+  const readBack = () => {
+    const row = db.raw.prepare('SELECT * FROM app_generation_state WHERE app_id = 7').get() as Record<string, unknown>
+    const { last_attempted_at, last_created_at, updated_at, ...rest } = row
+    expect(last_attempted_at).toMatch(DATETIME)
+    expect(updated_at).toMatch(DATETIME)
+    expect(last_created_at).toBeNull()   // エラー記録では「生まれた時刻」は触らない
+    return rest
+  }
+
+  it('1回目の失敗 → 窓は動かない、error_streak=1、他の列はそのまま', async () => {
     const r = await recordGenerationError(db as any, base, 50)
     expect(r.held).toBe(true)
-    expect(readBack()).toEqual({ window_offset: 100, error_streak: 1 })
+    expect(readBack()).toEqual({ app_id: 7, empty_streak: 0, window_offset: 100, cycle_created: 3, error_streak: 1 })
   })
 
   it('2回目の連続失敗 → その窓だけ飛ばす、error_streak=2（リセットされない）', async () => {
     const r = await recordGenerationError(db as any, { ...base, error_streak: 1 }, 50)
     expect(r.held).toBe(false)
-    expect(readBack()).toEqual({ window_offset: 150, error_streak: 2 })
+    expect(readBack()).toEqual({ app_id: 7, empty_streak: 0, window_offset: 150, cycle_created: 3, error_streak: 2 })
   })
 
   it('記録の書き込み自体が失敗しても例外にならない（生成は成功しているため）', async () => {
