@@ -74,6 +74,20 @@ const MUTATIONS = [
     before: '        (app_id, last_attempted_at, empty_streak, window_offset, cycle_created, error_streak, updated_at)',
     after:  '        (app_id, last_attempted_at, empty_streak, error_streak, cycle_created, window_offset, updated_at)',
   },
+  {
+    // 認証ミドルウェアより上の行に debug ルートを足す（登録順で素通りする形）
+    file: 'src/index.ts',
+    label: 'debug 認証: ミドルウェアより上に debug ルートが足される',
+    before: "// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())",
+    after:  "app.get('/api/debug/early', (c) => c.json({ ok: true }))\n// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())",
+  },
+  {
+    // /api/debug/ の外に管理用ルートを足す（パスで素通りする形）
+    file: 'src/index.ts',
+    label: 'debug 認証: /api/debug/ の外に admin ルートが足される',
+    before: "// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())",
+    after:  "// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())\napp.get('/api/admin/purge', (c) => c.json({ ok: true }))",
+  },
 ]
 
 function runTests() {

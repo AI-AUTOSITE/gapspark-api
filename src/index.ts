@@ -1021,6 +1021,10 @@ app.get('/api/debug/deep-dive/:id', async (c) => {
 // ======================================== 
 // Cron ジョブ（6時間ごとにレビュー取得・分析）
 // ========================================
+// テストがルート表（app.routes）をたどれるように公開する。
+// test/debug-auth.test.ts が「/api/debug/* の全ルートがヘッダなしで 401」を確認する。
+export { app }
+
 export default {
   fetch: app.fetch,
   async scheduled(controller: ScheduledController, env: Bindings, ctx: ExecutionContext) {
