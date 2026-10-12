@@ -165,6 +165,16 @@ jobs:
 
           print(f"==> 成功 {len(ok_ids)} / 失敗 {len(failed)} / 取得レビュー {len(rows)}")
 
+          # 【2026-10-11 追加】「全部空」はブロックとみなす。
+          # Apple は IP によって、エラーではなく正しい形の空フィード（200）を返して断る。
+          # 1 本ずつ見ると「レビューの無いアプリ」と区別できないが、20 本以上が
+          # 揃って 0 件になることは現実には起きない。保存も更新もせず、ジョブを赤にする。
+          if len(ok_ids) >= 20 and len(rows) == 0:
+              print(f"::error::All {len(ok_ids)} apps returned an empty feed with HTTP 200. "
+                    "This is a soft block, not an empty store. Nothing was recorded.")
+              open("soft_blocked.flag","w").write("1")
+              raise SystemExit(0)
+
           COLS = "(tracked_app_id, review_id, author, rating, title, body, app_version, region, review_date)"
           out = []
           for i in range(0, len(rows), 50):
@@ -196,6 +206,10 @@ jobs:
           if rate_limited:
               open("rate_limited.flag","w").write("1")
           PYEOF
+          if [ -f soft_blocked.flag ]; then
+            echo "::error::Apple soft block detected (every app returned an empty 200). Stopping."
+            exit 1
+          fi
           # 取れた分は必ず保存する（レート制限で途中停止しても、成功分は無駄にしない）
           if [ -s reviews.sql ]; then
             npx -y wrangler d1 execute gapspark-db --remote --file reviews.sql
@@ -207,4 +221,143 @@ jobs:
           if [ -f rate_limited.flag ]; then
             echo "::error::Stopped by Apple rate limit. Partial results were saved; remaining apps will be fetched next run."
             exit 1
+          fi
+
+      # ③ 新しく追加したアプリの過去レビューを深掘り（RSS の 1〜10 ページ目）
+      #
+      # 【2026-10-11 追加】② は最新 50 件しか取らないので、追加したばかりのアプリは
+      # 材料が 1 窓分しかない。deep_fetched_at が NULL のアプリだけ、一度だけ深掘りする。
+      #
+      # 「空のページ」の扱いがこのステップの要:
+      #   Apple は IP によって正しい形の空フィード（200）で断る。空を見ただけで
+      #   「終わり」と判断すると、ブロック中に全アプリを済みにしてしまう。
+      #   - 1 ページ目が空           → 判断できない。済みにしない、試行 +1
+      #   - 1 ページ目にあり、後が空 → 本当の終わり（フィードは生きていた）→ 済み
+      #   - 50 件未満のページ        → 最終ページ → 済み
+      #   - HTTP エラー / JSON 不正  → 失敗、試行 +1（429 か 403×3 なら全体を止める）
+      #   - 試行 3 回で決着しない     → 対象から外す（DB に残るので見える）
+      # 1 回の実行で最大 5 アプリ。② がレート制限で落ちたら、このステップは走らない。
+      - name: Deep backfill new apps
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -e
+          npx -y wrangler d1 execute gapspark-db --remote \
+            --command "SELECT id, apple_id FROM tracked_apps WHERE deep_fetched_at IS NULL AND deep_fetch_attempts < 3 ORDER BY deep_fetch_attempts, id LIMIT 5" \
+            --json > deep_apps.json
+          python3 << 'PYEOF'
+          import json, subprocess, time, re
+          apps = json.load(open("deep_apps.json"))[0]["results"]
+          if not apps:
+              print("==> 深掘り待ちのアプリはありません")
+              raise SystemExit(0)
+          print(f"==> {len(apps)} アプリを深掘りします")
+
+          PAGE_SIZE = 50
+          MAX_PAGE = 10
+
+          def esc(s):
+              if s is None: return ""
+              return re.sub(r"\s+", " ", str(s).replace("'", "''")).strip()
+
+          def fetch(url):
+              try:
+                  r = subprocess.run(["curl","-s","-A","Mozilla/5.0","-w","\n%{http_code}",url],
+                                     capture_output=True, text=True, timeout=25)
+                  body, _, code = r.stdout.rpartition("\n")
+                  code = code.strip()
+                  return (int(code) if code.isdigit() else None), body
+              except Exception:
+                  return None, ""
+
+          def reviews_in(body):
+              """レビューだけを返す（アプリ情報の行は im:rating を持たない）。読めなければ None"""
+              try:
+                  e = json.loads(body).get("feed", {}).get("entry")
+              except Exception:
+                  return None
+              if isinstance(e, dict): e = [e]
+              return [x for x in (e or []) if "im:rating" in x]
+
+          rows, done, inconclusive = [], [], []
+          consecutive_403 = 0
+          rate_limited = False
+
+          for a in apps:
+              aid, tid = a["apple_id"], a["id"]
+              got = 0
+              outcome = None          # "done" / "inconclusive"
+              for page in range(1, MAX_PAGE + 1):
+                  url = f"https://itunes.apple.com/us/rss/customerreviews/page={page}/id={aid}/sortby=mostrecent/json"
+                  code, body = fetch(url)
+                  if code != 200:
+                      consecutive_403 = consecutive_403 + 1 if code == 403 else 0
+                      print(f"  ✗ id={tid} page {page}: HTTP {code}")
+                      outcome = "inconclusive"
+                      if code == 429 or consecutive_403 >= 3:
+                          print(f"::error::Apple rate limit during deep backfill (HTTP {code}). Stopping.")
+                          rate_limited = True
+                      break
+                  consecutive_403 = 0
+                  page_reviews = reviews_in(body)
+                  if page_reviews is None:
+                      print(f"  ✗ id={tid} page {page}: bad json")
+                      outcome = "inconclusive"
+                      break
+                  if not page_reviews:
+                      # 1 ページ目が空なら判断できない（ブロックかもしれない）
+                      outcome = "done" if page > 1 else "inconclusive"
+                      break
+                  for r in page_reviews:
+                      try:
+                          rows.append(
+                              f"({tid}, '{esc(r['id']['label'])}', "
+                              f"'{esc(r.get('author',{}).get('name',{}).get('label',''))}', "
+                              f"{int(r.get('im:rating',{}).get('label','0') or 0)}, "
+                              f"'{esc(r.get('title',{}).get('label',''))}', "
+                              f"'{esc(r.get('content',{}).get('label',''))}', "
+                              f"'{esc(r.get('im:version',{}).get('label',''))}', 'us', "
+                              f"'{esc(r.get('updated',{}).get('label',''))}')")
+                      except Exception:
+                          pass
+                  got += len(page_reviews)
+                  if len(page_reviews) < PAGE_SIZE or page == MAX_PAGE:
+                      outcome = "done"     # 最終ページ
+                      break
+                  time.sleep(1.0)
+
+              (done if outcome == "done" else inconclusive).append(tid)
+              print(f"  {'✓' if outcome == 'done' else '…'} id={tid}: {got} 件"
+                    f"{'' if outcome == 'done' else '（決着せず。次回やり直し）'}")
+              if rate_limited:
+                  break
+              time.sleep(1.0)
+
+          COLS = "(tracked_app_id, review_id, author, rating, title, body, app_version, region, review_date)"
+          out = []
+          for i in range(0, len(rows), 50):
+              out.append(f"INSERT OR IGNORE INTO reviews {COLS} VALUES")
+              out.append(",\n".join(rows[i:i+50]) + ";")
+          if done:
+              out.append("UPDATE tracked_apps SET deep_fetched_at = datetime('now') "
+                         f"WHERE id IN ({','.join(map(str, done))});")
+          if inconclusive:
+              out.append("UPDATE tracked_apps SET deep_fetch_attempts = deep_fetch_attempts + 1 "
+                         f"WHERE id IN ({','.join(map(str, inconclusive))});")
+          open("deep.sql","w").write("\n".join(out) + "\n")
+          print(f"==> 深掘り: 済み {len(done)} / 決着せず {len(inconclusive)} / 取得 {len(rows)} 件")
+          if inconclusive:
+              print(f"::warning::{len(inconclusive)} app(s) not settled in deep backfill: "
+                    + ", ".join(f"id={t}" for t in inconclusive))
+          if rate_limited:
+              open("deep_rate_limited.flag","w").write("1")
+          PYEOF
+          if [ -s deep.sql ]; then
+            npx -y wrangler d1 execute gapspark-db --remote --file deep.sql
+            echo "==> 深掘り 書き込み完了"
+          fi
+          # 深掘りは補完なので、レート制限でもジョブは赤にしない（② が本命）。警告だけ残す
+          if [ -f deep_rate_limited.flag ]; then
+            echo "::warning::Deep backfill stopped by rate limit. Remaining apps will continue next run."
           fi
