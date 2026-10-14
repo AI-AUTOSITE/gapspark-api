@@ -2,7 +2,10 @@ name: Fetch Reviews to D1
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # 6時間ごとに自動実行
+    # 6時間ごとに自動実行。0分ちょうどを避けて17分にしている。
+    # GitHub は毎時0分の予定実行が最も混み、混雑時は遅延・破棄される
+    # （2026-10-13〜14 実測: 予定5回のうち2回が破棄、残りも最大1時間18分遅れ）。
+    - cron: '17 */6 * * *'
   workflow_dispatch:          # 手動実行も可能
 
 jobs:
@@ -139,7 +142,13 @@ jobs:
               # --- 失敗: 200 なのに JSON が読めない（エラーページなど） ---
               try:
                   entries = json.loads(body).get("feed", {}).get("entry")
-                  entries = entries[1:] if isinstance(entries, list) else []
+                  # 【2026-10-13 修正】以前は entries[1:] で「先頭はアプリ情報」として捨てていたが、
+                  # 今の Apple のフィードには先頭のアプリ情報行が無い（1 ページ目 50 件がすべて
+                  # レビュー）。そのため毎回、一番新しいレビューを 1 件捨てていた。
+                  # 深掘り（③）と同じく「im:rating を持つ行だけ」をレビューとみなす。
+                  # アプリ情報行があってもなくても正しく動く。
+                  if isinstance(entries, dict): entries = [entries]
+                  entries = [x for x in (entries or []) if "im:rating" in x]
               except Exception:
                   failed.append((tid, "bad json"))
                   print(f"  ✗ id={tid} bad json")
