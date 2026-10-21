@@ -1053,13 +1053,15 @@ export default {
     if (controller.cron === '0 */3 * * *') {
       // 【3時間ごと・専用レーン】ペインポイント生成だけを単独で実行。
       // 以前はフルパイプラインの最後にあり、前段が長引くと生成まで届かず
-      // 増えなかった。専用Cronに分離して確実に回す。5アプリ/回。
+      // 増えなかった。専用Cronに分離して確実に回す。8アプリ/回。
+      // （2026-10-18: 5→8。深掘りで材料が余り、処理枠が詰まりになったため。
+      //   9月実績 40窓≒5,400ニューロンから、64窓でも Workers AI 無料枠内の見込み）
       // 「ペインポイントが少ないアプリ優先」なので、回るたび手つかずのアプリが掘られる。
       console.log('Cron (pain point generation) started:', new Date().toISOString())
       ctx.waitUntil(
         (async () => {
           try {
-            const r = await generatePainPoints(env.DB, env.AI, 5)
+            const r = await generatePainPoints(env.DB, env.AI, 8)
             console.log('Pain point generation:', JSON.stringify(r))
           } catch (err) {
             console.error('Pain point generation error:', err)
