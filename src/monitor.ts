@@ -139,10 +139,27 @@ type PipelineHealth = {
   broken: { app_name: string; error_streak: number }[]   // 生成が連続エラー3回以上
   fetchBroken: { app_name: string; streak: number; last_error: string | null }[]  // 取得が連続失敗2回以上
   hnLastFetchErrors: number   // 直近の HN 巡回で検索に失敗したアプリ数
+  funnel: Funnel | null       // 生成のふるい（直近7日の合計）。記録がなければ null
+  dupExamples: DupExample[]   // 重複で落とした候補の見本（最新5件）
 }
 
+type Funnel = {
+  runs: number          // 記録された生成回数（8本/回 × 8回/日 なら約56回/週）
+  windows: number
+  candidates: number
+  raw: number
+  dup: number
+  quality: number
+  signal: number
+  created: number
+  errors: number
+  existing: number      // 重複判定の比較相手（期間中の最大）
+}
+
+type DupExample = { candidate: string; matched: string; kind: string; score: number }
+
 async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
-  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [], hnLastFetchErrors: 0 }
+  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [], hnLastFetchErrors: 0, funnel: null, dupExamples: [] }
   try {
     const st = await db.prepare(`
       SELECT empty_streak AS streak, COUNT(*) AS apps
@@ -188,7 +205,80 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
   } catch (e) {
     console.error('getPipelineHealth failed:', e)
   }
+
+  // 生成のふるい（migration 0014）。テーブルが無くても週報の他の欄は出したいので別の try
+  try {
+    const f = await db.prepare(`
+      SELECT COUNT(*) AS runs,
+             COALESCE(SUM(windows), 0)          AS windows,
+             COALESCE(SUM(candidates), 0)       AS candidates,
+             COALESCE(SUM(raw_rejected), 0)     AS raw,
+             COALESCE(SUM(dup_rejected), 0)     AS dup,
+             COALESCE(SUM(quality_rejected), 0) AS quality,
+             COALESCE(SUM(signal_rejected), 0)  AS signal,
+             COALESCE(SUM(created), 0)          AS created,
+             COALESCE(SUM(errors), 0)           AS errors,
+             COALESCE(MAX(existing_count), 0)   AS existing
+      FROM generation_runs
+      WHERE run_at >= datetime('now', '-7 days')
+    `).first<Record<keyof Funnel, number>>()
+    if (f && Number(f.runs) > 0) {
+      out.funnel = {
+        runs: Number(f.runs), windows: Number(f.windows), candidates: Number(f.candidates),
+        raw: Number(f.raw), dup: Number(f.dup), quality: Number(f.quality), signal: Number(f.signal),
+        created: Number(f.created), errors: Number(f.errors), existing: Number(f.existing),
+      }
+    }
+    const ex = await db.prepare(`
+      SELECT candidate_title, matched_title, kind, score
+      FROM rejected_duplicates ORDER BY id DESC LIMIT 5
+    `).all<{ candidate_title: string; matched_title: string; kind: string; score: number }>()
+    out.dupExamples = (ex.results ?? []).map(r => ({
+      candidate: r.candidate_title, matched: r.matched_title, kind: r.kind, score: Number(r.score),
+    }))
+  } catch (e) {
+    console.error('generation funnel read failed (migration 0014 applied?):', e)
+  }
   return out
+}
+
+// 週報に出す文字列の HTML エスケープ（AI が書いたタイトルに < や & が入りうる）
+function escHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+function pct(n: number, total: number): string {
+  return total > 0 ? `${Math.round((n / total) * 100)}%` : '—'
+}
+
+function funnelHtml(h: PipelineHealth): string {
+  const f = h.funnel
+  if (!f) {
+    return `
+  <h3>生成のふるい（直近7日）</h3>
+  <p style="font-size:13px">まだ記録がありません（2026-10-25 から記録開始）。</p>`
+  }
+  const row = (label: string, n: number, strong = false) =>
+    `<tr><td>${label}</td><td style="text-align:right">${strong ? '<b>' : ''}${fmt(n)}${strong ? '</b>' : ''}</td><td style="text-align:right">${pct(n, f.candidates)}</td></tr>`
+  const examples = h.dupExamples.length === 0 ? '' : `
+  <p style="font-size:13px">重複で除外された例（最新${h.dupExamples.length}件）— <b>本当に同じ不満か</b>を目で確かめる:</p>
+  <ul style="font-size:13px">
+    ${h.dupExamples.map(e =>
+      `<li>「${escHtml(e.candidate)}」<br>　← 既存「${escHtml(e.matched)}」（${e.kind === 'title' ? 'タイトル' : '要約'}の重なり ${e.score.toFixed(2)}）</li>`
+    ).join('\n    ')}
+  </ul>`
+  return `
+  <h3>生成のふるい（直近7日）</h3>
+  <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
+    <tr style="background:#f0f0f0"><th>段階</th><th>件数</th><th>候補に対する割合</th></tr>
+    ${row('候補（モデルが出した数）', f.candidates)}
+    ${row('生レビューの写しで除外', f.raw)}
+    ${row('重複で除外', f.dup, true)}
+    ${row('品質（長さ・曖昧さ）で除外', f.quality)}
+    ${row('裏付けが弱く除外（2件未満）', f.signal)}
+    ${row('保存', f.created, true)}
+  </table>
+  <p style="font-size:13px">記録された生成回数: ${fmt(f.runs)} 回（想定 約56回/週）・読んだ窓: ${fmt(f.windows)}・失敗した窓: ${fmt(f.errors)}（窓は保持）・重複判定の比較相手: ${fmt(f.existing)} 件</p>${examples}`
 }
 
 // ===== HTML部品 =====
@@ -291,6 +381,8 @@ function weeklyReportHtml(stats: Stats, prev: PrevStats, trend: TrendRow[], heal
     recommend = `注意: ${health.broken.length} 件のアプリが連続でエラーになっています（下の「パイプラインの状態」に名前あり）。材料切れではなく故障です。そのアプリのレビュー取得か、Workers AI 側の状態を確認してください。他のアプリの生成は続いています。`
   } else if (zeroDays >= 2) {
     recommend = `注意: 直近6日のうち ${zeroDays} 日、生成がゼロでした。<b>アプリを足す前に</b>、下の「パイプラインの確認」を上から順に見てください。9月に同じ症状が出たとき、原因は材料切れではなく D1 の枠超過でした。`
+  } else if (health.funnel && health.funnel.candidates >= 20 && health.funnel.dup / health.funnel.candidates >= 0.5) {
+    recommend = `注意: 直近7日の候補 ${fmt(health.funnel.candidates)} 件のうち、${pct(health.funnel.dup, health.funnel.candidates)} が「重複」で除外されています。下の「生成のふるい」の例を見て、本当に同じ不満か確かめてください。別物が混ざっているなら、重複判定が厳しすぎます。`
   } else if (stuckRatio >= 0.6) {
     recommend = `注意: ${stuckApps} / ${health.total} アプリが「1周まるごと空振り」を3回以上続けています。生成は動いていますが、窓が薄いか重複除去が厳しすぎる可能性があります。生成されたタイトルの質を目視で確認してください。`
   }
@@ -312,6 +404,7 @@ function weeklyReportHtml(stats: Stats, prev: PrevStats, trend: TrendRow[], heal
     <p>${recommend}</p>
     ${trendTableHtml(trend)}
     ${healthTableHtml(health)}
+    ${funnelHtml(health)}
     ${decisionTableHtml()}
     <hr>
     <p style="color:#888;font-size:12px">GapSpark 運用監視より自動送信</p>

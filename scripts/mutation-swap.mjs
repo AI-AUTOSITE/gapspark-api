@@ -15,8 +15,36 @@
 // 使い方:  npm run test:swap
 // ============================================================
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+
+// ------------------------------------------------------------
+// 途中で止められても、変異させたファイルを必ず元に戻す
+// ------------------------------------------------------------
+// 2026-10-25 に実際に起きた: 実行が途中で強制終了され、ソースが変異した状態で残った。
+// 気づかずにコミットすれば、壊れたコードが本番に出る。
+//   1. 変異させる前に、元の中身を BACKUP に書いておく（強制終了でも次回の最初に復元）
+//   2. Ctrl+C では親プロセスを生かしたまま子（vitest）だけ止まるので、その場で戻して終わる
+const BACKUP = '.mutation-backup.json'
+if (existsSync(BACKUP)) {
+  const b = JSON.parse(readFileSync(BACKUP, 'utf8'))
+  writeFileSync(b.file, b.original)
+  unlinkSync(BACKUP)
+  console.log(`⚠️  前回の実行が途中で止まっていたので、${b.file} を元に戻しました`)
+}
+process.on('SIGINT', () => {})    // 親は即死させない（子が止まったあと、自分で戻して終わる）
+process.on('SIGTERM', () => {})
+function applyMutant(file, original, mutant) {
+  writeFileSync(BACKUP, JSON.stringify({ file, original }))
+  writeFileSync(file, mutant)
+}
+function restoreFile(file, original) {
+  writeFileSync(file, original)
+  if (existsSync(BACKUP)) unlinkSync(BACKUP)
+}
+function interrupted(r) {
+  return Boolean(r.signal) || r.status === 130
+}
 
 // 検査する INSERT 文。file と、列リストを一意に特定できる先頭部分
 const TARGETS = [
@@ -33,10 +61,24 @@ const TARGETS = [
     columns: '(category, title, summary, severity_score, frequency, sample_app_ids, keywords, related_topics, ai_generated_idea, mention_count, sample_size, ai_model_used, last_updated_at)',
     equivalent: [],
   },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: 'recordGenerationRun → generation_runs',
+    columns: '(windows, candidates, raw_rejected, dup_rejected, quality_rejected, signal_rejected, created, errors, existing_count)',
+    equivalent: [],
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: 'recordGenerationRun → rejected_duplicates',
+    columns: '(app_id, candidate_title, matched_title, kind, score)',
+    equivalent: [],
+  },
 ]
 
+let lastRunInterrupted = false
 function runTests() {
   const r = spawnSync('npx', ['vitest', 'run'], { encoding: 'utf8' })
+  lastRunInterrupted = interrupted(r)
   return r.status === 0
 }
 
@@ -71,9 +113,13 @@ for (const t of TARGETS) {
 
     const swapped = cols.map((c) => (c === a ? b : c === b ? a : c))
     const mutant = original.replace(t.columns, '(' + swapped.join(', ') + ')')
-    writeFileSync(t.file, mutant)
+    applyMutant(t.file, original, mutant)
     let ok
-    try { ok = runTests() } finally { writeFileSync(t.file, original) }
+    try { ok = runTests() } finally { restoreFile(t.file, original) }
+    if (lastRunInterrupted) {
+      console.log(`\n中断しました。${t.file} は元に戻してあります。`)
+      process.exit(130)
+    }
     if (ok) {
       survived.push(`${t.label}: ${a} ⇄ ${b}`)
       console.log(`  🟢 ${a} ⇄ ${b}   ← 緑のまま`)

@@ -15,8 +15,36 @@
 // 各ミューテーションを適用 → vitest 実行 → 復元。1つでも緑のままなら exit 1。
 // ============================================================
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, unlinkSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+
+// ------------------------------------------------------------
+// 途中で止められても、変異させたファイルを必ず元に戻す
+// ------------------------------------------------------------
+// 2026-10-25 に実際に起きた: 実行が途中で強制終了され、ソースが変異した状態で残った。
+// 気づかずにコミットすれば、壊れたコードが本番に出る。
+//   1. 変異させる前に、元の中身を BACKUP に書いておく（強制終了でも次回の最初に復元）
+//   2. Ctrl+C では親プロセスを生かしたまま子（vitest）だけ止まるので、その場で戻して終わる
+const BACKUP = '.mutation-backup.json'
+if (existsSync(BACKUP)) {
+  const b = JSON.parse(readFileSync(BACKUP, 'utf8'))
+  writeFileSync(b.file, b.original)
+  unlinkSync(BACKUP)
+  console.log(`⚠️  前回の実行が途中で止まっていたので、${b.file} を元に戻しました`)
+}
+process.on('SIGINT', () => {})    // 親は即死させない（子が止まったあと、自分で戻して終わる）
+process.on('SIGTERM', () => {})
+function applyMutant(file, original, mutant) {
+  writeFileSync(BACKUP, JSON.stringify({ file, original }))
+  writeFileSync(file, mutant)
+}
+function restoreFile(file, original) {
+  writeFileSync(file, original)
+  if (existsSync(BACKUP)) unlinkSync(BACKUP)
+}
+function interrupted(r) {
+  return Boolean(r.signal) || r.status === 130
+}
 
 const MUTATIONS = [
   {
@@ -87,13 +115,31 @@ const MUTATIONS = [
     label: 'debug 認証: /api/debug/ の外に admin ルートが足される',
     before: "// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())",
     after:  "// CORS設定（iOSアプリからのアクセス許可）\napp.use('/*', cors())\napp.get('/api/admin/purge', (c) => c.json({ ok: true }))",
+  },  {
+    // 2026-10-25 に見つけた穴：モデルが2回失敗しても数えるだけで握りつぶし、窓が「空」として進む
+    file: 'src/cron/generate-pain-points.ts',
+    label: '生成: モデル失敗を握りつぶして窓を進める（9/30 の直し漏れ）',
+    before: '            else throw e',
+    after:  '            else errors++',
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: 'ふるい: 重複で除外した数を記録しない',
+    before: '    dupRejected: duplicatesSkipped,',
+    after:  '    dupRejected: 0,',
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: 'ふるい: 重複の見本を集めない',
+    before: '      dupRejections.push(...appRejections.map(r => ({ ...r, appId: app.app_id })))',
+    after:  '      void appRejections',
   },
 ]
 
 function runTests() {
   const r = spawnSync('npx', ['vitest', 'run'], { encoding: 'utf8' })
   const m = /(\d+) failed/.exec(r.stdout + r.stderr)
-  return { ok: r.status === 0, failed: m ? Number(m[1]) : 0 }
+  return { ok: r.status === 0, failed: m ? Number(m[1]) : 0, interrupted: interrupted(r) }
 }
 
 // まず素の状態で通ることを確認（通らなければ判定できない）
@@ -112,12 +158,16 @@ for (const m of MUTATIONS) {
     survived++
     continue
   }
-  writeFileSync(m.file, original.replace(m.before, m.after))
+  applyMutant(m.file, original, original.replace(m.before, m.after))
   let result
   try {
     result = runTests()
   } finally {
-    writeFileSync(m.file, original)   // 何があっても必ず戻す
+    restoreFile(m.file, original)   // 何があっても必ず戻す
+  }
+  if (result.interrupted) {
+    console.log(`\n中断しました。${m.file} は元に戻してあります。`)
+    process.exit(130)
   }
   if (result.ok) {
     console.log(`  🟢 ${m.label}\n      → 緑のまま。この修正は誰にも守られていません`)

@@ -40,3 +40,4 @@ yarn-error.log*
 # Test
 coverage/
 *.lcov
+.mutation-backup.json

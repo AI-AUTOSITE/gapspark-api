@@ -127,16 +127,24 @@ export async function generatePainPoints(
   appsPerRun: number = 10
 ): Promise<{
   appsProcessed: number
+  candidates: number
   painPointsCreated: number
   duplicatesSkipped: number
   rawCopiesRejected: number
+  qualityRejected: number
+  signalRejected: number
   errors: number
 }> {
   let appsProcessed = 0
+  let candidatesTotal = 0     // モデルが出した候補の総数（ふるいの入口）
   let painPointsCreated = 0
   let duplicatesSkipped = 0
   let rawCopiesRejected = 0
+  let qualityRejected = 0
+  let signalRejected = 0
   let errors = 0
+  // 重複で落とした候補の見本（何と一致したか）。最後に generation_runs と一緒に記録する
+  const dupRejections: (DedupRejection & { appId: number })[] = []
 
   // 候補アプリは app_stats_cache から読むだけ（約200行）。
   // 集計は6時間cronの refreshAppStatsCache() が担当する。
@@ -155,7 +163,7 @@ export async function generatePainPoints(
 
   if (candidates.length === 0) {
     console.log('No candidate apps (all on backoff cooldown, or none with enough negative reviews)')
-    return { appsProcessed: 0, painPointsCreated: 0, duplicatesSkipped: 0, rawCopiesRejected: 0, errors: 0 }
+    return { appsProcessed: 0, candidates: 0, painPointsCreated: 0, duplicatesSkipped: 0, rawCopiesRejected: 0, qualityRejected: 0, signalRejected: 0, errors: 0 }
   }
 
   const apps = { results: candidates }
@@ -166,6 +174,7 @@ export async function generatePainPoints(
   ).all<ExistingPainPoint>()
   const globalTitles = allExisting.results?.map(p => p.title) || []
   const globalSummaries = allExisting.results?.map(p => p.summary) || []
+  const existingCount = globalTitles.length   // 重複判定の比較相手の数（記録用）
 
   console.log(`Generating pain points for ${apps.results.length} apps (${globalTitles.length} existing)...`)
 
@@ -228,12 +237,19 @@ export async function generatePainPoints(
           } catch (e) {
             console.error(`    Llama error (attempt ${attempt}):`, e)
             if (attempt < 2) await new Promise(r => setTimeout(r, 5000))
-            else errors++
+            // 【2026-10-25 修正】2回目も失敗したら、例外を外へ投げる。
+            // 以前は errors++ で数えるだけで握りつぶしていたため、候補0件として
+            // 「空だった窓」扱いになり、窓が進んでいた（9/30 に「例外にした」と
+            // 説明したが、この再試行ループが最後に飲み込んでいた）。
+            // 外の catch が recordGenerationError で窓を保持し、errors も数える。
+            else throw e
           }
         }
 
         await new Promise(r => setTimeout(r, 3000))
       }
+
+      candidatesTotal += allPainPoints.length
 
       // 生レビューコピーの除去（重複除去より前に必ず実行する）
       // Discover に生のレビュー文が出るのはガイドライン上いちばん危険な失敗。
@@ -253,8 +269,10 @@ export async function generatePainPoints(
       rawCopiesRejected += allPainPoints.length - original.length
 
       // 重複除去（ローカル + グローバル）
-      const unique = deduplicatePainPoints(original, globalTitles, globalSummaries)
+      const appRejections: DedupRejection[] = []
+      const unique = deduplicatePainPoints(original, globalTitles, globalSummaries, appRejections)
       duplicatesSkipped += original.length - unique.length
+      dupRejections.push(...appRejections.map(r => ({ ...r, appId: app.app_id })))
 
       if (original.length > unique.length) {
         console.log(`    Dedup: ${original.length} → ${unique.length}`)
@@ -269,6 +287,7 @@ export async function generatePainPoints(
         return true
       })
 
+      qualityRejected += unique.length - quality.length
       if (quality.length < unique.length) {
         console.log(`    Quality filter: ${unique.length} → ${quality.length}`)
       }
@@ -278,6 +297,7 @@ export async function generatePainPoints(
       // これで Discover に "1件由来の弱いペインポイント" が残らなくなる。
       const MIN_SUPPORTING_REVIEWS = 2
       const wellSupported = quality.filter(pp => pp.matchingReviewCount >= MIN_SUPPORTING_REVIEWS)
+      signalRejected += quality.length - wellSupported.length
 
       if (wellSupported.length < quality.length) {
         console.log(`    Signal filter: ${quality.length} → ${wellSupported.length} (dropped weakly-supported <${MIN_SUPPORTING_REVIEWS} reviews)`)
@@ -321,8 +341,21 @@ export async function generatePainPoints(
     }
   }
 
-  console.log(`Complete: ${appsProcessed} apps, ${painPointsCreated} created, ${duplicatesSkipped} dupes, ${rawCopiesRejected} raw-copies, ${errors} errors`)
-  return { appsProcessed, painPointsCreated, duplicatesSkipped, rawCopiesRejected, errors }
+  console.log(`Complete: ${appsProcessed} apps, ${candidatesTotal} candidates → ${painPointsCreated} created (${rawCopiesRejected} raw-copies, ${duplicatesSkipped} dupes, ${qualityRejected} quality, ${signalRejected} weak signal), ${errors} errors`)
+
+  await recordGenerationRun(db, {
+    windows: appsProcessed,
+    candidates: candidatesTotal,
+    rawRejected: rawCopiesRejected,
+    dupRejected: duplicatesSkipped,
+    qualityRejected,
+    signalRejected,
+    created: painPointsCreated,
+    errors,
+    existingCount,
+  }, dupRejections)
+
+  return { appsProcessed, candidates: candidatesTotal, painPointsCreated, duplicatesSkipped, rawCopiesRejected, qualityRejected, signalRejected, errors }
 }
 
 
@@ -492,24 +525,55 @@ Return the pain points as {"pain_points": [...]}.`
 // 重複除去（v3: 強化版）
 // ========================================
 
-function deduplicatePainPoints(
+export interface DedupRejection {
+  candidateTitle: string
+  matchedTitle: string          // 一致と判定された相手のタイトル
+  kind: 'title' | 'summary'
+  score: number                 // 重なりの割合（小さい方の語数で割った値）
+}
+
+// 判定のしかたは 2026-10-25 以前と同じ。rejections を渡すと、落とした候補が
+// 「何と」「どれだけ」重なったかを集める（週報で、厳しすぎるかを目で確かめるため）。
+export function deduplicatePainPoints(
   newPoints: ScoredPainPoint[],
   globalTitles: string[],
-  globalSummaries: string[]
+  globalSummaries: string[],
+  rejections?: DedupRejection[]
 ): ScoredPainPoint[] {
   const unique: ScoredPainPoint[] = []
   const titleSets = globalTitles.map(t => extractWords(t))
   const summarySets = globalSummaries.map(s => extractWords(s))
+  // それぞれの集合が「どのペインポイントのものか」をタイトルで持つ。
+  // summary で一致したときも、人が見て分かるよう相手のタイトルを記録する。
+  // globalTitles と globalSummaries は同じ順（呼び出し側が組で積む）。
+  const titleOf = [...globalTitles]
+  const summaryOwner = globalSummaries.map((_, i) => globalTitles[i] ?? '')
+
+  const firstMatch = (sets: Set<string>[], target: Set<string>, threshold: number) => {
+    for (let i = 0; i < sets.length; i++) {
+      const r = wordOverlapRatio(target, sets[i])
+      if (r >= threshold) return { i, r }
+    }
+    return null
+  }
 
   for (const point of newPoints) {
     const ptTitle = extractWords(point.title)
     const ptSummary = extractWords(point.summary)
-    
+
     // タイトル重複（閾値0.4）
-    if (titleSets.some(e => wordOverlapRatio(ptTitle, e) >= 0.4)) continue
+    const t = firstMatch(titleSets, ptTitle, 0.4)
+    if (t) {
+      rejections?.push({ candidateTitle: point.title, matchedTitle: titleOf[t.i], kind: 'title', score: t.r })
+      continue
+    }
     // サマリー重複（閾値0.5）
-    if (summarySets.some(e => wordOverlapRatio(ptSummary, e) >= 0.5)) continue
-    // バッチ内重複
+    const sm = firstMatch(summarySets, ptSummary, 0.5)
+    if (sm) {
+      rejections?.push({ candidateTitle: point.title, matchedTitle: summaryOwner[sm.i], kind: 'summary', score: sm.r })
+      continue
+    }
+    // バッチ内重複（上の2つが同じ回の採用分も含めて比べているので、通常ここには来ない）
     if (unique.some(u => 
       wordOverlapRatio(ptTitle, extractWords(u.title)) >= 0.4 ||
       wordOverlapRatio(ptSummary, extractWords(u.summary)) >= 0.5
@@ -517,10 +581,64 @@ function deduplicatePainPoints(
 
     unique.push(point)
     titleSets.push(ptTitle)
+    titleOf.push(point.title)
     summarySets.push(ptSummary)
+    summaryOwner.push(point.title)
   }
 
   return unique
+}
+
+// ========================================
+// 生成の「ふるい」の記録（migration 0014）
+// ========================================
+export interface GenerationRunStats {
+  windows: number
+  candidates: number
+  rawRejected: number
+  dupRejected: number
+  qualityRejected: number
+  signalRejected: number
+  created: number
+  errors: number
+  existingCount: number
+}
+
+const MAX_DUP_SAMPLES_PER_RUN = 20   // 1回の生成で記録する見本の上限
+const KEEP_DUP_SAMPLES = 300         // テーブルに残す見本の数（古いものから消す）
+
+// 生成1回ぶんの集計と、重複の見本を記録する。
+// 記録の失敗で生成を失敗にはしない（ペインポイントの保存はもう終わっている）。
+// 記録が抜けた回は、週報の「記録された生成回数」が想定（約56回/週）より減るので見える。
+export async function recordGenerationRun(
+  db: D1Database,
+  s: GenerationRunStats,
+  rejections: (DedupRejection & { appId: number })[] = []
+): Promise<void> {
+  try {
+    const stmts = [
+      db.prepare(`
+        INSERT INTO generation_runs
+          (windows, candidates, raw_rejected, dup_rejected, quality_rejected, signal_rejected, created, errors, existing_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(s.windows, s.candidates, s.rawRejected, s.dupRejected, s.qualityRejected, s.signalRejected, s.created, s.errors, s.existingCount),
+    ]
+    for (const r of rejections.slice(0, MAX_DUP_SAMPLES_PER_RUN)) {
+      stmts.push(db.prepare(`
+        INSERT INTO rejected_duplicates (app_id, candidate_title, matched_title, kind, score)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(r.appId, r.candidateTitle.slice(0, 200), r.matchedTitle.slice(0, 200), r.kind, Math.round(r.score * 100) / 100))
+    }
+    if (rejections.length > 0) {
+      stmts.push(db.prepare(`
+        DELETE FROM rejected_duplicates
+        WHERE id <= (SELECT MAX(id) - ? FROM rejected_duplicates)
+      `).bind(KEEP_DUP_SAMPLES))
+    }
+    await db.batch(stmts)
+  } catch (e) {
+    console.error('  recordGenerationRun failed (generation itself succeeded):', e)
+  }
 }
 
 
