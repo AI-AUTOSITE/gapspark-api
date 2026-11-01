@@ -549,10 +549,19 @@ export function deduplicatePainPoints(
   const titleOf = [...globalTitles]
   const summaryOwner = globalSummaries.map((_, i) => globalTitles[i] ?? '')
 
-  const firstMatch = (sets: Set<string>[], target: Set<string>, threshold: number) => {
-    for (let i = 0; i < sets.length; i++) {
-      const r = wordOverlapRatio(target, sets[i])
-      if (r >= threshold) return { i, r }
+  // タイトルは Jaccard（isTitleDuplicate）、要約は従来どおり wordOverlapRatio ≥ 0.5。
+  // 要約で落ちたのは見本 300 件中 4 件だけで、半分は本当の重複だったので変えていない。
+  const firstTitleMatch = (target: Set<string>) => {
+    for (let i = 0; i < titleSets.length; i++) {
+      const r = isTitleDuplicate(target, titleSets[i])
+      if (r !== null) return { i, r }
+    }
+    return null
+  }
+  const firstSummaryMatch = (target: Set<string>) => {
+    for (let i = 0; i < summarySets.length; i++) {
+      const r = wordOverlapRatio(target, summarySets[i])
+      if (r >= 0.5) return { i, r }
     }
     return null
   }
@@ -561,21 +570,21 @@ export function deduplicatePainPoints(
     const ptTitle = extractWords(point.title)
     const ptSummary = extractWords(point.summary)
 
-    // タイトル重複（閾値0.4）
-    const t = firstMatch(titleSets, ptTitle, 0.4)
+    // タイトル重複（Jaccard 0.5 以上）
+    const t = firstTitleMatch(ptTitle)
     if (t) {
       rejections?.push({ candidateTitle: point.title, matchedTitle: titleOf[t.i], kind: 'title', score: t.r })
       continue
     }
-    // サマリー重複（閾値0.5）
-    const sm = firstMatch(summarySets, ptSummary, 0.5)
+    // サマリー重複（重なり 0.5 以上・従来どおり）
+    const sm = firstSummaryMatch(ptSummary)
     if (sm) {
       rejections?.push({ candidateTitle: point.title, matchedTitle: summaryOwner[sm.i], kind: 'summary', score: sm.r })
       continue
     }
     // バッチ内重複（上の2つが同じ回の採用分も含めて比べているので、通常ここには来ない）
     if (unique.some(u => 
-      wordOverlapRatio(ptTitle, extractWords(u.title)) >= 0.4 ||
+      isTitleDuplicate(ptTitle, extractWords(u.title)) !== null ||
       wordOverlapRatio(ptSummary, extractWords(u.summary)) >= 0.5
     )) continue
 
@@ -742,6 +751,32 @@ function isCopyOfReviewTitle(generatedTitle: string, reviewTitles: string[]): bo
     if (wordOverlapRatio(genWords, extractWords(raw)) >= 0.7) return true  // ほぼ同じ
   }
   return false
+}
+
+// ========================================
+// タイトルの重複判定（2026-11-01 変更）
+// ========================================
+// 以前は wordOverlapRatio（重なった語数 ÷ 短い方の語数）で 0.4 以上を重複にしていた。
+// この割り方だと、既存の短いタイトルが1語かぶっただけで 0.5 になる。
+// 「Crashes and Instability」(2語) は crash を含む候補を、「Calendar Issues」は
+// issues を含む候補を、テーマに関係なく吸い込んでいた。
+//
+// 2026-10-25〜11-01 の見本 296 件を目で確かめた結果:
+//   - 重複で落とされた候補の約 75% は別の不満だった
+//   - 296 件中 122 件は、2語以下の既存タイトル（25 種類）に吸い込まれていた
+// Jaccard（重なった語数 ÷ 両方の語の合計）の 0.5 以上なら、落とすもののほぼ全部が
+// 本当の重複で、0.4〜0.5 の帯は別物の方が多かった。
+// 弱点: 言い換え（unchangeable ↔ cannot be changed）は語が違うので見抜けない。
+export const TITLE_DUP_THRESHOLD = 0.5
+export function jaccardRatio(setA: Set<string>, setB: Set<string>): number {
+  if (setA.size === 0 || setB.size === 0) return 0
+  let overlap = 0
+  for (const word of setA) { if (setB.has(word)) overlap++ }
+  return overlap / (setA.size + setB.size - overlap)
+}
+export function isTitleDuplicate(a: Set<string>, b: Set<string>): number | null {
+  const r = jaccardRatio(a, b)
+  return r >= TITLE_DUP_THRESHOLD ? r : null
 }
 
 function wordOverlapRatio(setA: Set<string>, setB: Set<string>): number {
@@ -1039,7 +1074,8 @@ export async function deduplicateExistingPainPoints(
     const ptSummary = extractWords(pp.summary)
     
     const isDuplicate = kept.some(k => {
-      const titleDup = wordOverlapRatio(ptTitle, extractWords(k.title)) >= 0.4
+      // 生成時と同じ基準にする（古い基準のまま実行すると、別の不満を既存データから消してしまう）
+      const titleDup = isTitleDuplicate(ptTitle, extractWords(k.title)) !== null
       const summaryDup = wordOverlapRatio(ptSummary, extractWords(k.summary)) >= 0.5
       
       if (k.appIds === pp.sample_app_ids) return titleDup || summaryDup   // 同アプリ

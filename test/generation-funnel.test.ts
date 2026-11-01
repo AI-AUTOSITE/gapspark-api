@@ -18,6 +18,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import {
   generatePainPoints,
   deduplicatePainPoints,
+  deduplicateExistingPainPoints,
+  isTitleDuplicate,
   recordGenerationRun,
   type DedupRejection,
   type ScoredPainPoint,
@@ -45,7 +47,7 @@ describe('deduplicatePainPoints: 落とした候補が「何と」重なった�
       [...existingTitles], [...existingSummaries], rejections)
     expect(out).toEqual([])
     expect(rejections).toEqual([{
-      candidateTitle: 'Sync fails offline', matchedTitle: 'Offline sync fails after update', kind: 'title', score: 1,
+      candidateTitle: 'Sync fails offline', matchedTitle: 'Offline sync fails after update', kind: 'title', score: 0.75,
     }])
   })
 
@@ -71,6 +73,68 @@ describe('deduplicatePainPoints: 落とした候補が「何と」重なった�
     expect(withCollector.map(p => p.title)).toEqual(without.map(p => p.title))
     // 同じ回の先行候補との重複も落ちる（2本目の Export）
     expect(without.map(p => p.title)).toEqual(['Export stalls at ninety percent', 'Widget shows stale weather'])
+  })
+})
+
+// ------------------------------------------------------------
+// 1b. 重複判定の線引き — 2026-10-25〜11-01 の見本 296 件からの実例
+// ------------------------------------------------------------
+// 旧基準（短い方の語数で割って 0.4 以上）では、どれも「重複」として落ちていた。
+// 目で確かめて、上は本当の重複、下は別の不満だったもの。
+describe('タイトルの重複判定: 本当の重複は落とし、別の不満は通す', () => {
+  const reject = (cand: string, existing: string) =>
+    deduplicatePainPoints([pp(cand, 'candidate summary that shares nothing with the other one')],
+      [existing], ['an unrelated existing summary about something else entirely'])
+
+  it.each([
+    ['Increased taps required to end focus session', 'Increased taps required to end focus session'],
+    ['Increased steps to log food after update', 'Increased steps to log food'],
+    ['Refunds denied or delayed for incomplete orders', 'Refunds denied for incomplete orders'],
+    ['Food arrives cold due to delivery delays', 'Food arrives cold due to delayed delivery'],
+  ])('本当の重複は落ちる: 「%s」←「%s」', (cand, existing) => {
+    expect(reject(cand, existing)).toEqual([])
+  })
+
+  it.each([
+    ['Notifications fail after period of app inactivity', 'Notifications are not cool'],
+    ['Event editing fails on iOS after software update', 'Fails to update assets after update'],
+    ['Unable to combine gift cards for payment', 'Unable to rename gift cards in app'],       // 新しい計算でちょうど 0.4
+    ['Payment authentication fails on order placement', 'Inconsistent Ad Placement'],
+    ['App crashes on launch after recent update', 'Crashes and Instability'],
+  ])('別の不満は通る: 「%s」←「%s」', (cand, existing) => {
+    expect(reject(cand, existing).map(p => p.title)).toEqual([cand])
+  })
+
+  it('線はちょうど 0.5（0.5 は落とし、0.4 は通す）', () => {
+    // 語の集合で直接確かめる（重なり2語）
+    expect(isTitleDuplicate(new Set(['a1', 'b2', 'c3']), new Set(['a1', 'b2', 'd4']))).toBe(0.5)   // 2/4
+    expect(isTitleDuplicate(new Set(['a1', 'b2', 'c3']), new Set(['a1', 'b2', 'd4', 'e5']))).toBeNull()  // 2/5 = 0.4
+  })
+})
+
+// ------------------------------------------------------------
+// 1c. 既存データの掃除（debug）も同じ線引きを使う
+// ------------------------------------------------------------
+// 同じアプリなら「タイトルか要約のどちらかが重なれば消す」作り。古い基準のままだと、
+// 別の不満を既存データから消してしまう（生成で落とすより取り返しがつかない）。
+describe('deduplicateExistingPainPoints: 別の不満は消さない', () => {
+  let db: TestDb
+  beforeEach(() => { db = createTestDb() })
+  const add = (title: string, summary: string) => db.raw.prepare(
+    `INSERT INTO pain_points (category, title, summary, sample_app_ids) VALUES ('X', ?, ?, '[7]')`).run(title, summary)
+
+  it('同じアプリでも、旧基準でだけ重なるものは両方残る', async () => {
+    add('Notifications are not cool', 'Alert sounds and banners feel dated and look unpolished.')
+    add('Notifications fail after period of app inactivity', 'Reminders stop arriving once the phone sits idle for days.')
+    const r = await deduplicateExistingPainPoints(db as any)
+    expect(r).toEqual({ total: 2, removed: 0, remaining: 2 })
+  })
+
+  it('本当の重複は1件にまとまる', async () => {
+    add('Food arrives cold due to delivery delays', 'Orders sit too long before pickup and arrive lukewarm.')
+    add('Food arrives cold due to delayed delivery', 'Drivers batch several orders so meals cool down on the way.')
+    const r = await deduplicateExistingPainPoints(db as any)
+    expect(r).toEqual({ total: 2, removed: 1, remaining: 1 })
   })
 })
 

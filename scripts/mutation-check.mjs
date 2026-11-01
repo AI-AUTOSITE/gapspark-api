@@ -134,6 +134,25 @@ const MUTATIONS = [
     before: '      dupRejections.push(...appRejections.map(r => ({ ...r, appId: app.app_id })))',
     after:  '      void appRejections',
   },
+  {
+    // 2026-11-01 に直した基準を、古い計算（短い方の語数で割る・0.4）に戻す
+    file: 'src/cron/generate-pain-points.ts',
+    label: '重複判定: 古い計算（短い方で割る・0.4）に戻る',
+    before: '  return r >= TITLE_DUP_THRESHOLD ? r : null',
+    after:  '  const o = wordOverlapRatio(a, b); return o >= 0.4 ? o : null',
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: '重複判定: 線を 0.5 から 0.4 に下げる',
+    before: 'export const TITLE_DUP_THRESHOLD = 0.5',
+    after:  'export const TITLE_DUP_THRESHOLD = 0.4',
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: '既存の掃除: 古い計算のまま既存データを消す',
+    before: '      const titleDup = isTitleDuplicate(ptTitle, extractWords(k.title)) !== null',
+    after:  '      const titleDup = wordOverlapRatio(ptTitle, extractWords(k.title)) >= 0.4',
+  },
 ]
 
 function runTests() {
