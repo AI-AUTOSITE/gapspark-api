@@ -153,6 +153,25 @@ const MUTATIONS = [
     before: '      const titleDup = isTitleDuplicate(ptTitle, extractWords(k.title)) !== null',
     after:  '      const titleDup = wordOverlapRatio(ptTitle, extractWords(k.title)) >= 0.4',
   },
+  {
+    // 2026-11-23 に直した読む順番を、「空振りの少ないアプリが先」に戻す
+    file: 'src/stats.ts',
+    label: '読む順番: 空振りの少ないアプリを優先に戻る（62本が読まれなくなる形）',
+    before: '    if (aAt !== bAt) return aAt < bAt ? -1 : 1',
+    after:  '    if (num(a.empty_streak) !== num(b.empty_streak)) return num(a.empty_streak) - num(b.empty_streak)\n    if (aAt !== bAt) return aAt < bAt ? -1 : 1',
+  },
+  {
+    file: 'src/monitor.ts',
+    label: '週報: 待ち時間を過ぎても読まれないアプリを見張らない',
+    before: "      .filter((r): r is { app_name: string; past: number } => r.past !== null && r.past >= STARVED_AFTER_HOURS)",
+    after:  "      .filter((r): r is { app_name: string; past: number } => false)",
+  },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: '生成: 失敗した窓の理由を記録しない',
+    before: '      errorSamples.push({ appId: app.app_id, message: errorMessage(e) })',
+    after:  '      void errorMessage',
+  },
 ]
 
 function runTests() {

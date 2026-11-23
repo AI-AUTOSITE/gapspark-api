@@ -73,6 +73,12 @@ const TARGETS = [
     columns: '(app_id, candidate_title, matched_title, kind, score)',
     equivalent: [],
   },
+  {
+    file: 'src/cron/generate-pain-points.ts',
+    label: 'recordGenerationRun → generation_errors',
+    columns: '(app_id, message)',
+    equivalent: [],
+  },
 ]
 
 let lastRunInterrupted = false

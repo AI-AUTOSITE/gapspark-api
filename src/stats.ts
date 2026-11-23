@@ -234,6 +234,21 @@ const MAX_BACKOFF_STEPS = 6        // 2^6 = 64 → 384時間（16日）で頭打
  * 「乾いている」と「壊れている」は別の状態だが、どちらも待たせる理由になる。
  * 別々に数えて、長いほうを採用する。
  */
+// 待ち時間が終わってから何時間たったか（まだ待ち時間中ならマイナス）。
+// 未着手（last_attempted_at が null）は null。読む順番と、週報の「放置されたアプリ」の両方で使う。
+export function hoursPastCooldown(
+  lastAttemptedAt: string | null,
+  emptyStreak: number,
+  errorStreak: number,
+  now: number = Date.now()
+): number | null {
+  if (!lastAttemptedAt) return null
+  // SQLite の datetime('now') は "YYYY-MM-DD HH:MM:SS"（UTC）形式
+  const attempted = Date.parse(lastAttemptedAt.replace(' ', 'T') + 'Z')
+  if (!Number.isFinite(attempted)) return null
+  return (now - attempted) / 3600_000 - cooldownHours(emptyStreak, errorStreak)
+}
+
 export function cooldownHours(emptyStreak: number, errorStreak = 0): number {
   const fromEmpty = Math.max(emptyStreak, 0)
   const fromError = Math.max(errorStreak - 1, 0)
@@ -298,28 +313,27 @@ export async function readCandidateApps(
 
   const now = Date.now()
 
+  // 待ち時間が終わったアプリだけが対象（未着手・壊れた日時は常に対象）
   const ready = (res.results ?? []).filter((row) => {
-    if (!row.last_attempted_at) return true   // 未着手は常に対象
-    // SQLite の datetime('now') は "YYYY-MM-DD HH:MM:SS"（UTC）形式
-    const attempted = Date.parse(row.last_attempted_at.replace(' ', 'T') + 'Z')
-    if (!Number.isFinite(attempted)) return true   // 壊れた値なら対象に含める
-    const waitMs = cooldownHours(num(row.empty_streak), num(row.error_streak)) * 3600_000
-    return now - attempted >= waitMs
+    const past = hoursPastCooldown(row.last_attempted_at, num(row.empty_streak), num(row.error_streak), now)
+    return past === null || past >= 0
   })
 
+  // 【2026-11-23 変更】読む順番は「未着手 → いちばん長く読まれていないもの」だけで決める。
+  //
+  // 以前は 空振りの少なさ → エラーの少なさ → ペインポイントの少なさ の順だった。
+  // 空振り0回のアプリが54本あり、6時間ごとに対象へ戻るので、1日64枠を毎回それだけで
+  // 使い切っていた。空振り1回の62本は 11/1 を最後に一度も読まれず、いちばん古いものは
+  // 9/25 から手つかずだった（週報の空振り分布が3週間 54/62 のまま動かなかった）。
+  // 空振り0回の中でも「ペインポイントが少ない順」のため、成果を出したアプリほど後回しで、
+  // 最も古いものは2週間読まれていなかった。
+  //
+  // 空振りやエラーへの罰は、待ち時間（cooldownHours）ですでに受けている。
+  // 並び順でも罰すると二重になり、待ち時間が終わっても順番が永久に回ってこない。
   ready.sort((a, b) => {
-    const aNew = a.last_attempted_at ? 1 : 0
-    const bNew = b.last_attempted_at ? 1 : 0
-    if (aNew !== bNew) return aNew - bNew
-    const aStreak = num(a.empty_streak)
-    const bStreak = num(b.empty_streak)
-    if (aStreak !== bStreak) return aStreak - bStreak
-    const aErr = num(a.error_streak)
-    const bErr = num(b.error_streak)
-    if (aErr !== bErr) return aErr - bErr   // 落ち続けているアプリは後回し
-    if (a.existing_pain_points !== b.existing_pain_points) {
-      return a.existing_pain_points - b.existing_pain_points
-    }
+    const aAt = a.last_attempted_at ?? ''   // 未着手（null）は '' として最も古い扱い
+    const bAt = b.last_attempted_at ?? ''
+    if (aAt !== bAt) return aAt < bAt ? -1 : 1
     return b.negative_count - a.negative_count
   })
 

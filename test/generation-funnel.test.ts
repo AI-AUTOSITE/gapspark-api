@@ -181,6 +181,15 @@ describe('recordGenerationRun: 1回分の集計と見本を記録する', () => 
     expect(r.first).toBe(21)
   })
 
+  it('失敗の理由は列に入り、最新200件だけ残る', async () => {
+    const errs = Array.from({ length: 30 }, (_, i) => ({ appId: 7, message: `InferenceUpstreamError: timeout ${i}` }))
+    for (let run = 0; run < 7; run++) await recordGenerationRun(db as any, stats, [], errs)
+    const r = db.raw.prepare('SELECT COUNT(*) AS n, MIN(id) AS first FROM generation_errors').get() as { n: number; first: number }
+    expect(r).toEqual({ n: 200, first: 11 })   // 7回 × 30件 = 210件 → 古い10件が消える
+    const last = db.raw.prepare('SELECT app_id, message FROM generation_errors ORDER BY id DESC LIMIT 1').get()
+    expect(last).toEqual({ app_id: 7, message: 'InferenceUpstreamError: timeout 29' })
+  })
+
   it('記録に失敗しても例外にしない（保存はもう終わっている）', async () => {
     db.raw.exec('DROP TABLE generation_runs')
     await expect(recordGenerationRun(db as any, stats)).resolves.toBeUndefined()
@@ -239,6 +248,9 @@ describe('generatePainPoints: モデルが失敗した窓は「空」ではな�
     expect(state(db)).toEqual({ window_offset: 0, error_streak: 1 })   // 窓は保持
     const g = db.raw.prepare('SELECT windows, candidates, errors FROM generation_runs').get()
     expect(g).toEqual({ windows: 0, candidates: 0, errors: 1 })
+    // 失敗の理由が、どのアプリのものか分かる形で残る（migration 0015）
+    const e = db.raw.prepare('SELECT app_id, message FROM generation_errors').all()
+    expect(e).toEqual([{ app_id: 7, message: 'Error: model unavailable' }])
   })
 })
 
@@ -311,7 +323,106 @@ describe('週報: 生成のふるい', () => {
     expect(sentHtml).toMatch(/<b>24<\/b><\/td><td[^>]*>60%/)          // 重複 24 件 = 候補の 60%
     expect(sentHtml).toContain('Export &lt;fails&gt; &amp; stalls')   // そのまま埋め込まない
     expect(sentHtml).not.toContain('<fails>')
-    // 重複が候補の半分以上 → 「今やること」で注意を出す
-    expect(sentHtml).toContain('「重複」で除外されています')
+    // 2026-11-23: 重複の割合だけでは注意を出さない（既存が増えれば自然に上がるため）
+    expect(sentHtml).not.toContain('「重複」で除外されています')
+    expect(sentHtml).toContain('OK 順調です')
+  })
+})
+
+// ------------------------------------------------------------
+// 5. 読む順番 — 待ち時間が終わったら、いちばん長く読まれていないものから
+// ------------------------------------------------------------
+// 2026-11-23: 「空振りの少ないアプリが先」だったため、空振り0回の54本が1日64枠を
+// 使い切り、空振り1回の62本は 11/1 から一度も読まれていなかった（最古は 9/25）。
+import { readCandidateApps } from '../src/stats'
+import { STARVED_AFTER_HOURS } from '../src/monitor'
+
+// 「○時間前」を SQLite の datetime 形式で
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString().slice(0, 19).replace('T', ' ')
+
+function seedApps(db: TestDb, apps: { id: number; name: string; streak?: number; err?: number; ppCount?: number; at?: string | null }[]) {
+  for (const a of apps) {
+    db.raw.prepare(`INSERT INTO tracked_apps (id, apple_id, app_name, category) VALUES (?, ?, ?, 'X')`).run(a.id, String(900 + a.id), a.name)
+    db.raw.prepare(`INSERT INTO app_stats_cache (app_id, negative_count, pain_point_count) VALUES (?, 100, ?)`).run(a.id, a.ppCount ?? 0)
+    if (a.at !== null) {
+      db.raw.prepare(`INSERT INTO app_generation_state (app_id, last_attempted_at, empty_streak, error_streak) VALUES (?, ?, ?, ?)`)
+        .run(a.id, a.at, a.streak ?? 0, a.err ?? 0)
+    }
+  }
+}
+
+describe('readCandidateApps: 未着手 → いちばん長く読まれていないもの の順', () => {
+  let db: TestDb
+  beforeEach(() => { db = createTestDb() })
+
+  it('空振り1回でも、待ち時間が終わっていて一番古ければ先に読まれる', async () => {
+    seedApps(db, [
+      { id: 1, name: 'fresh-productive', streak: 0, at: hoursAgo(7) },          // 待ち6h → 対象
+      { id: 2, name: 'starved-dry',      streak: 1, at: hoursAgo(24 * 50) },    // 待ち12h → 対象、50日前
+      { id: 3, name: 'never-read',       at: null },                             // 未着手
+      { id: 4, name: 'just-read',        streak: 0, at: hoursAgo(1) },          // 待ち中 → 対象外
+      { id: 5, name: 'dry-cooling',      streak: 1, at: hoursAgo(10) },         // 待ち12h中 → 対象外
+      { id: 6, name: 'many-pp',          streak: 0, at: hoursAgo(48), ppCount: 90 },
+    ])
+    const picked = await readCandidateApps(db as any, 10)
+    expect(picked.map(a => a.app_name)).toEqual(['never-read', 'starved-dry', 'many-pp', 'fresh-productive'])
+  })
+
+  it('空振りの罰は待ち時間で受ける（並び順では罰さない）', async () => {
+    seedApps(db, [
+      { id: 1, name: 'dry-3', streak: 3, at: hoursAgo(49) },   // 待ち48h → 対象、49h前
+      { id: 2, name: 'dry-0', streak: 0, at: hoursAgo(8) },    // 待ち6h → 対象、8h前
+    ])
+    const picked = await readCandidateApps(db as any, 1)
+    expect(picked.map(a => a.app_name)).toEqual(['dry-3'])
+  })
+})
+
+describe('週報: 待ち時間が終わっても読まれないアプリと、失敗の理由', () => {
+  let db: TestDb
+  let sentHtml = ''
+  beforeEach(() => {
+    db = createTestDb()
+    sentHtml = ''
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: any) => {
+      sentHtml = JSON.parse(init.body).html
+      return new Response('{}', { status: 200 })
+    }))
+    for (let d = 0; d < 7; d++) {
+      db.raw.prepare(`INSERT INTO pain_points (category, title, summary, created_at)
+                      VALUES ('X', ?, 'summary text long enough', datetime('now', ?))`).run(`pp ${d}`, `-${d} days`)
+    }
+  })
+  afterEach(() => { vi.unstubAllGlobals() })
+
+  it('待ち時間が終わってから3日以上読まれていないアプリは、名前と日数つきで注意に出る', async () => {
+    seedApps(db, [
+      { id: 1, name: 'Forgotten <App>', streak: 1, at: hoursAgo(12 + STARVED_AFTER_HOURS + 24) },  // 4日放置
+      { id: 2, name: 'Recent',          streak: 0, at: hoursAgo(5) },
+    ])
+    await sendWeeklyReportNow({ DB: db as any, RESEND_API_KEY: 'x' } as any)
+    expect(sentHtml).toContain('3日以上読まれていないアプリ: 1 本')
+    expect(sentHtml).toContain('Forgotten &lt;App&gt; — 4日')
+    expect(sentHtml).not.toContain('Recent —')
+    expect(sentHtml).toContain('読む順番に偏りがあります')
+  })
+
+  it('放置がなければ「なし」と出て、注意も出ない', async () => {
+    seedApps(db, [{ id: 1, name: 'Fine', streak: 1, at: hoursAgo(13) }])
+    await sendWeeklyReportNow({ DB: db as any, RESEND_API_KEY: 'x' } as any)
+    expect(sentHtml).toContain('3日以上読まれていないアプリ: なし')
+    expect(sentHtml).not.toContain('読む順番に偏りがあります')
+  })
+
+  it('失敗した窓の理由が、多い順に件数つきで出る', async () => {
+    const stats = { windows: 8, candidates: 20, rawRejected: 0, dupRejected: 5, qualityRejected: 0, signalRejected: 0, created: 5, errors: 3, existingCount: 100 }
+    await recordGenerationRun(db as any, stats, [], [
+      { appId: 1, message: 'Error: Unparseable model response: Sure! Here are' },
+      { appId: 2, message: 'Error: Unparseable model response: Sure! Here are' },
+      { appId: 3, message: 'InferenceUpstreamError: <timeout>' },
+    ])
+    await sendWeeklyReportNow({ DB: db as any, RESEND_API_KEY: 'x' } as any)
+    expect(sentHtml).toContain('失敗した窓の理由')
+    expect(sentHtml).toMatch(/2 件 — <code>Error: Unparseable model response: Sure! Here are<\/code>[\s\S]*1 件 — <code>InferenceUpstreamError: &lt;timeout&gt;<\/code>/)
   })
 })

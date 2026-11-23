@@ -145,6 +145,8 @@ export async function generatePainPoints(
   let errors = 0
   // 重複で落とした候補の見本（何と一致したか）。最後に generation_runs と一緒に記録する
   const dupRejections: (DedupRejection & { appId: number })[] = []
+  // 失敗した窓のエラー内容。最後に generation_errors へ記録する（migration 0015）
+  const errorSamples: GenerationErrorSample[] = []
 
   // 候補アプリは app_stats_cache から読むだけ（約200行）。
   // 集計は6時間cronの refreshAppStatsCache() が担当する。
@@ -331,6 +333,7 @@ export async function generatePainPoints(
 
     } catch (e) {
       console.error(`  Error processing ${app.app_name}:`, e)
+      errorSamples.push({ appId: app.app_id, message: errorMessage(e) })
       // エラーは「空だった」とは別物。窓は動かさず、次回同じ窓を読み直す。
       // 2回連続で落ちたときだけ、その窓を飛ばす（永久ループ防止）。
       const r = await recordGenerationError(db, app, REVIEWS_PER_CALL)
@@ -353,7 +356,7 @@ export async function generatePainPoints(
     created: painPointsCreated,
     errors,
     existingCount,
-  }, dupRejections)
+  }, dupRejections, errorSamples)
 
   return { appsProcessed, candidates: candidatesTotal, painPointsCreated, duplicatesSkipped, rawCopiesRejected, qualityRejected, signalRejected, errors }
 }
@@ -613,6 +616,18 @@ export interface GenerationRunStats {
   existingCount: number
 }
 
+export interface GenerationErrorSample {
+  appId: number
+  message: string
+}
+
+// エラーを1行の文字列にする。Error なら「名前: メッセージ」、それ以外は String()。
+export function errorMessage(e: unknown): string {
+  if (e instanceof Error) return `${e.name}: ${e.message}`.slice(0, 300)
+  return String(e).slice(0, 300)
+}
+
+const KEEP_ERROR_SAMPLES = 200       // generation_errors に残す件数
 const MAX_DUP_SAMPLES_PER_RUN = 20   // 1回の生成で記録する見本の上限
 const KEEP_DUP_SAMPLES = 300         // テーブルに残す見本の数（古いものから消す）
 
@@ -622,7 +637,8 @@ const KEEP_DUP_SAMPLES = 300         // テーブルに残す見本の数（古�
 export async function recordGenerationRun(
   db: D1Database,
   s: GenerationRunStats,
-  rejections: (DedupRejection & { appId: number })[] = []
+  rejections: (DedupRejection & { appId: number })[] = [],
+  errorSamples: GenerationErrorSample[] = []
 ): Promise<void> {
   try {
     const stmts = [
@@ -643,6 +659,17 @@ export async function recordGenerationRun(
         DELETE FROM rejected_duplicates
         WHERE id <= (SELECT MAX(id) - ? FROM rejected_duplicates)
       `).bind(KEEP_DUP_SAMPLES))
+    }
+    for (const err of errorSamples) {
+      stmts.push(db.prepare(`
+        INSERT INTO generation_errors (app_id, message) VALUES (?, ?)
+      `).bind(err.appId, err.message.slice(0, 300)))
+    }
+    if (errorSamples.length > 0) {
+      stmts.push(db.prepare(`
+        DELETE FROM generation_errors
+        WHERE id <= (SELECT MAX(id) - ? FROM generation_errors)
+      `).bind(KEEP_ERROR_SAMPLES))
     }
     await db.batch(stmts)
   } catch (e) {

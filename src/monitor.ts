@@ -15,7 +15,7 @@
 //      どれも材料切れではなかった。「増えない → 先にパイプラインを疑う」に変更。
 //   d) 空振り（empty_streak）の分布と窓の回転状況も載せる
 
-import { readCachedStats, type Counts } from './stats'
+import { readCachedStats, hoursPastCooldown, type Counts } from './stats'
 
 type MonitorEnv = {
   DB: D1Database
@@ -141,7 +141,13 @@ type PipelineHealth = {
   hnLastFetchErrors: number   // 直近の HN 巡回で検索に失敗したアプリ数
   funnel: Funnel | null       // 生成のふるい（直近7日の合計）。記録がなければ null
   dupExamples: DupExample[]   // 重複で落とした候補の見本（最新5件）
+  starved: { app_name: string; days: number }[]   // 待ち時間が終わってから3日以上読まれていないアプリ
+  errorReasons: { reason: string; n: number }[]   // 失敗した窓の理由（直近7日・多い順）
 }
+
+// 待ち時間が終わってから、この時間を過ぎても読まれていなければ「放置」とみなす。
+// 1日64枠・116アプリなら、全アプリが同時に対象になっても約1.8日で一巡する。
+export const STARVED_AFTER_HOURS = 72
 
 type Funnel = {
   runs: number          // 記録された生成回数（8本/回 × 8回/日 なら約56回/週）
@@ -159,7 +165,7 @@ type Funnel = {
 type DupExample = { candidate: string; matched: string; kind: string; score: number }
 
 async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
-  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [], hnLastFetchErrors: 0, funnel: null, dupExamples: [] }
+  const out: PipelineHealth = { streaks: [], rotating: 0, maxOffset: 0, total: 0, broken: [], fetchBroken: [], hnLastFetchErrors: 0, funnel: null, dupExamples: [], starved: [], errorReasons: [] }
   try {
     const st = await db.prepare(`
       SELECT empty_streak AS streak, COUNT(*) AS apps
@@ -188,6 +194,24 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
       LIMIT 10
     `).all<{ app_name: string; error_streak: number }>()
     out.broken = (br.results ?? []).map(r => ({ app_name: r.app_name, error_streak: Number(r.error_streak) }))
+
+    // 待ち時間が終わっても読まれないアプリ（読む順番の偏り）。
+    // 2026-11 に、空振り1回の62本が3週間以上読まれていなかったのに、週報には何も出なかった。
+    // 候補の条件（readCandidateApps）と同じく、ネガティブ5件以上のアプリだけを見る。
+    const sv = await db.prepare(`
+      SELECT ta.app_name AS app_name, g.last_attempted_at AS last_attempted_at,
+             g.empty_streak AS empty_streak, g.error_streak AS error_streak
+      FROM app_generation_state g
+      JOIN tracked_apps ta ON ta.id = g.app_id
+      JOIN app_stats_cache s ON s.app_id = g.app_id
+      WHERE s.negative_count >= 5
+    `).all<{ app_name: string; last_attempted_at: string | null; empty_streak: number; error_streak: number }>()
+    const now = Date.now()
+    out.starved = (sv.results ?? [])
+      .map(r => ({ app_name: r.app_name, past: hoursPastCooldown(r.last_attempted_at, Number(r.empty_streak) || 0, Number(r.error_streak) || 0, now) }))
+      .filter((r): r is { app_name: string; past: number } => r.past !== null && r.past >= STARVED_AFTER_HOURS)
+      .sort((a, b) => b.past - a.past)
+      .map(r => ({ app_name: r.app_name, days: Math.floor(r.past / 24) }))
 
     // レビュー取得が連続で失敗しているアプリ（Apple 側の問題・ストアから消えた等）
     const fb = await db.prepare(`
@@ -239,6 +263,19 @@ async function getPipelineHealth(db: D1Database): Promise<PipelineHealth> {
   } catch (e) {
     console.error('generation funnel read failed (migration 0014 applied?):', e)
   }
+
+  // 失敗した窓の理由（migration 0015）。先頭60文字でまとめて、多い順に3つ
+  try {
+    const er = await db.prepare(`
+      SELECT substr(message, 1, 60) AS reason, COUNT(*) AS n
+      FROM generation_errors
+      WHERE at >= datetime('now', '-7 days')
+      GROUP BY reason ORDER BY n DESC LIMIT 3
+    `).all<{ reason: string; n: number }>()
+    out.errorReasons = (er.results ?? []).map(r => ({ reason: r.reason, n: Number(r.n) }))
+  } catch (e) {
+    console.error('generation error read failed (migration 0015 applied?):', e)
+  }
   return out
 }
 
@@ -260,6 +297,11 @@ function funnelHtml(h: PipelineHealth): string {
   }
   const row = (label: string, n: number, strong = false) =>
     `<tr><td>${label}</td><td style="text-align:right">${strong ? '<b>' : ''}${fmt(n)}${strong ? '</b>' : ''}</td><td style="text-align:right">${pct(n, f.candidates)}</td></tr>`
+  const reasons = h.errorReasons.length === 0 ? '' : `
+  <p style="font-size:13px">失敗した窓の理由（直近7日・多い順）:</p>
+  <ul style="font-size:13px">
+    ${h.errorReasons.map(r => `<li>${r.n} 件 — <code>${escHtml(r.reason)}</code></li>`).join('\n    ')}
+  </ul>`
   const examples = h.dupExamples.length === 0 ? '' : `
   <p style="font-size:13px">重複で除外された例（最新${h.dupExamples.length}件）— <b>本当に同じ不満か</b>を目で確かめる:</p>
   <ul style="font-size:13px">
@@ -278,7 +320,7 @@ function funnelHtml(h: PipelineHealth): string {
     ${row('裏付けが弱く除外（2件未満）', f.signal)}
     ${row('保存', f.created, true)}
   </table>
-  <p style="font-size:13px">記録された生成回数: ${fmt(f.runs)} 回（想定 約56回/週）・読んだ窓: ${fmt(f.windows)}・失敗した窓: ${fmt(f.errors)}（窓は保持）・重複判定の比較相手: ${fmt(f.existing)} 件</p>${examples}`
+  <p style="font-size:13px">記録された生成回数: ${fmt(f.runs)} 回（想定 約56回/週）・読んだ窓: ${fmt(f.windows)}・失敗した窓: ${fmt(f.errors)}（窓は保持）・重複判定の比較相手: ${fmt(f.existing)} 件</p>${reasons}${examples}`
 }
 
 // ===== HTML部品 =====
@@ -320,6 +362,10 @@ function healthTableHtml(h: PipelineHealth): string {
   const hnHtml = h.hnLastFetchErrors === 0
     ? `<p style="font-size:13px">Hacker News 検索の失敗（直近の巡回）: なし</p>`
     : `<p style="font-size:13px;color:#c00"><b>Hacker News 検索の失敗（直近の巡回）: ${h.hnLastFetchErrors} 件</b> — Algolia 側の不調か、特定アプリの検索語が通らない可能性</p>`
+  const starvedHtml = h.starved.length === 0
+    ? `<p style="font-size:13px">待ち時間が終わってから3日以上読まれていないアプリ: なし</p>`
+    : `<p style="font-size:13px;color:#c00"><b>待ち時間が終わってから3日以上読まれていないアプリ: ${h.starved.length} 本</b>（読む順番の偏り）</p>
+       <ul style="font-size:13px;color:#c00">${h.starved.slice(0, 10).map(a => `<li>${escHtml(a.app_name)} — ${a.days}日</li>`).join('')}${h.starved.length > 10 ? `<li>ほか ${h.starved.length - 10} 本</li>` : ''}</ul>`
   return `
   <h3>パイプラインの状態</h3>
   <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse;font-size:14px">
@@ -327,6 +373,7 @@ function healthTableHtml(h: PipelineHealth): string {
     ${streakRows}
   </table>
   <p style="font-size:13px">窓の回転: ${h.rotating} / ${h.total} アプリが途中の窓を読んでいる（最大 offset ${fmt(h.maxOffset)}）</p>
+  ${starvedHtml}
   ${brokenHtml}
   ${fetchHtml}
   ${hnHtml}`
@@ -381,8 +428,10 @@ function weeklyReportHtml(stats: Stats, prev: PrevStats, trend: TrendRow[], heal
     recommend = `注意: ${health.broken.length} 件のアプリが連続でエラーになっています（下の「パイプラインの状態」に名前あり）。材料切れではなく故障です。そのアプリのレビュー取得か、Workers AI 側の状態を確認してください。他のアプリの生成は続いています。`
   } else if (zeroDays >= 2) {
     recommend = `注意: 直近6日のうち ${zeroDays} 日、生成がゼロでした。<b>アプリを足す前に</b>、下の「パイプラインの確認」を上から順に見てください。9月に同じ症状が出たとき、原因は材料切れではなく D1 の枠超過でした。`
-  } else if (health.funnel && health.funnel.candidates >= 20 && health.funnel.dup / health.funnel.candidates >= 0.5) {
-    recommend = `注意: 直近7日の候補 ${fmt(health.funnel.candidates)} 件のうち、${pct(health.funnel.dup, health.funnel.candidates)} が「重複」で除外されています。下の「生成のふるい」の例を見て、本当に同じ不満か確かめてください。別物が混ざっているなら、重複判定が厳しすぎます。`
+  } else if (health.starved.length > 0) {
+    // 【2026-11-23】重複の割合による注意は外した。11/1 の修正後は見本のほぼ全部が本当の重複で、
+    // 既存が増えるほど割合は自然に上がる（2,000件超で50%台）。割合だけでは良し悪しが分からない。
+    recommend = `注意: ${health.starved.length} 本のアプリが、待ち時間が終わってから3日以上読まれていません（下の「パイプラインの状態」に名前あり）。読む順番に偏りがあります。生成は動いていますが、一部のアプリだけが繰り返し読まれています。`
   } else if (stuckRatio >= 0.6) {
     recommend = `注意: ${stuckApps} / ${health.total} アプリが「1周まるごと空振り」を3回以上続けています。生成は動いていますが、窓が薄いか重複除去が厳しすぎる可能性があります。生成されたタイトルの質を目視で確認してください。`
   }
